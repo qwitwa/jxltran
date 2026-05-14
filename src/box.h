@@ -85,6 +85,20 @@ static constexpr uint32_t kStripAll = ~0u;
 // never removed regardless of flags.
 void StripBoxesByType(std::vector<JxlBox>* boxes, uint32_t strip_flags);
 
+// Writes the uncompressed payload of the first Exif, XMP (xml ), or JUMBF
+// (jumb) box matching |want_type| to |payload|. Decompresses brob wrappers
+// when built with brotli; otherwise returns false for brob. Returns false if
+// not found or on decompression error.
+bool ExtractMetadataPayloadToBuffer(const std::vector<JxlBox>& boxes,
+                                    const char want_type[4],
+                                    std::vector<uint8_t>* payload);
+
+// Removes all boxes matching |target_type| (including brob-wrapped), then
+// inserts a new box with |payload| before the first codestream box.
+// |target_type| must be "Exif", "xml ", or "jumb".
+void ReplaceMetadataBox(std::vector<JxlBox>* boxes, const char target_type[4],
+                        std::vector<uint8_t> payload);
+
 // Controls where non-structural metadata boxes are placed relative to the
 // codestream when reordering.
 enum class BoxOrder {

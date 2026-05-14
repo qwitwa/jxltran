@@ -12,6 +12,7 @@
 
 #include "bits.h"
 #include "entropy.h"
+#include "entropy_trace.h"
 #include "printf_macros.h"
 #include "trace.h"
 
@@ -161,12 +162,18 @@ static bool SkipTocPermutation(BitReader& br, size_t size) {
 // Decodes permutation into |perm| (size |size|).
 static bool DecodeTocPermutation(BitReader& br, size_t size,
                                  std::vector<uint32_t>* perm) {
+  const size_t bits0 = br.pos();
+  EntropyTrace("DecodeTocPermutation begin bits=%" PRIuS " size=%" PRIuS,
+               bits0, size);
   EntropyCoder ec;
   if (!InitEntropyCoder(br, /*num_contexts=*/8, /*disallow_lz77=*/false, &ec)) {
     return false;
   }
+  EntropyTrace("DecodeTocPermutation after_InitEntropyCoder bits=%" PRIuS,
+               br.pos());
   const uint32_t end =
       DecodeHybridUint(br, ec, CoeffOrderContext(static_cast<uint32_t>(size)));
+  EntropyTrace("DecodeTocPermutation end_count=%u bits=%" PRIuS, end, br.pos());
   if (end > size) {
     (void)FinalizeEntropyCoder(ec);
     return false;
@@ -176,12 +183,17 @@ static bool DecodeTocPermutation(BitReader& br, size_t size,
   for (size_t i = 0; i < end; ++i) {
     lehmer[i] = DecodeHybridUint(br, ec, CoeffOrderContext(last));
     last = lehmer[i];
+    if (EntropyTraceEnabled() && i < 64) {
+      EntropyTrace("  lehmer[%" PRIuS "]=%u ctx_last=%u bits=%" PRIuS, i,
+                   lehmer[i], last, br.pos());
+    }
     if (lehmer[i] >= size - i) {
       (void)FinalizeEntropyCoder(ec);
       return false;
     }
   }
   if (!FinalizeEntropyCoder(ec)) return false;
+  EntropyTrace("DecodeTocPermutation after_finalize bits=%" PRIuS, br.pos());
 
   perm->resize(size);
   const size_t log2n = CeilLog2Nonzero(size);
@@ -190,17 +202,74 @@ static bool DecodeTocPermutation(BitReader& br, size_t size,
   return DecodeLehmerCode(lehmer.data(), temp.data(), size, perm->data());
 }
 
+static bool ComputeLehmerCode(const uint32_t* permutation, size_t n,
+                                std::vector<uint32_t>* lehmer) {
+  std::vector<uint32_t> temp(n + 1, 0);
+  lehmer->resize(n);
+  for (size_t idx = 0; idx < n; ++idx) {
+    const uint32_t s = permutation[idx];
+    uint32_t penalty = 0;
+    uint32_t i = s + 1;
+    while (i != 0) {
+      penalty += temp[i];
+      i &= i - 1;
+    }
+    if (s < penalty) return false;
+    (*lehmer)[idx] = s - penalty;
+    i = s + 1;
+    while (i < n + 1) {
+      temp[i] += 1;
+      i += static_cast<uint32_t>(ValueOfLowest1Bit(i));
+    }
+  }
+  return true;
+}
+
+static bool IsValidPermutation(const std::vector<uint32_t>& p, size_t n) {
+  if (p.size() != n) return false;
+  std::vector<bool> seen(n, false);
+  for (uint32_t v : p) {
+    if (static_cast<size_t>(v) >= n || seen[v]) return false;
+    seen[v] = true;
+  }
+  return true;
+}
+
+static bool BuildTocPermHybridToks(size_t toc_size,
+                                   const std::vector<uint32_t>& perm,
+                                   std::vector<HybridTok>* out) {
+  std::vector<uint32_t> lehmer;
+  if (!ComputeLehmerCode(perm.data(), toc_size, &lehmer)) return false;
+  size_t end = toc_size;
+  while (end > 0 && lehmer[end - 1] == 0) --end;
+  out->clear();
+  HybridTok first{};
+  HybridUint000Encode(static_cast<uint32_t>(end), &first.token, &first.nbits,
+                      &first.bits);
+  out->push_back(first);
+  for (size_t i = 0; i < end; ++i) {
+    HybridTok t{};
+    HybridUint000Encode(lehmer[i], &t.token, &t.nbits, &t.bits);
+    out->push_back(t);
+  }
+  return true;
+}
+
 }  // namespace
 
 bool ReadFullToc(BitReader& br, size_t toc_entries, uint64_t* total,
                  std::vector<uint32_t>* sizes_opt,
-                 std::vector<uint32_t>* perm_opt) {
+                 std::vector<uint32_t>* perm_opt,
+                 size_t* bits_before_sizes_out) {
   *total = 0;
   if (toc_entries == 0 || toc_entries > 65536) return false;
 
+  const size_t read_start = br.pos();
   {
     const size_t p = br.pos();
     const bool have_perm = br.ReadBool();
+    EntropyTrace("ReadFullToc permutation_flag=%d bits=%" PRIuS,
+                 have_perm ? 1 : 0, br.pos());
     TraceReadField(p, "read.toc.permutation_flag", "%s",
                    have_perm ? "true" : "false");
     if (have_perm) {
@@ -215,6 +284,9 @@ bool ReadFullToc(BitReader& br, size_t toc_entries, uint64_t* total,
   }
   if (!JumpToByteBoundary(br)) return false;
   TraceReadField(br.pos(), "read.toc.after_perm_pad", "(byte-aligned)");
+  if (bits_before_sizes_out != nullptr) {
+    *bits_before_sizes_out = br.pos() - read_start;
+  }
 
   if (sizes_opt != nullptr) {
     sizes_opt->clear();
@@ -234,20 +306,48 @@ bool ReadFullToc(BitReader& br, size_t toc_entries, uint64_t* total,
 }
 
 bool ReadToc(BitReader& br, size_t toc_entries, uint64_t* total) {
-  return ReadFullToc(br, toc_entries, total, nullptr, nullptr);
+  return ReadFullToc(br, toc_entries, total, nullptr, nullptr, nullptr);
 }
 
 bool WriteDecodedToc(BitWriter& bw, size_t /*header_bits_mod8*/,
                      const std::vector<uint32_t>& perm_u32,
                      const std::vector<uint32_t>& sizes_u32) {
-  if (!perm_u32.empty()) {
+  if (perm_u32.empty()) {
+    bw.WriteBool(false);
+    bw.ZeroPadToByte();
+    for (uint32_t s : sizes_u32) {
+      WriteU32(bw, s, kTocDist[0], kTocDist[1], kTocDist[2], kTocDist[3]);
+    }
+    bw.ZeroPadToByte();
+    return true;
+  }
+  if (perm_u32.size() != sizes_u32.size()) {
     fprintf(stderr,
-            "jxltran: cannot re-encode TOC with permutation (bit phase "
-            "changed); use a codestream without TOC permutation\n");
+            "jxltran: TOC permutation length (%" PRIuS ") does not match TOC "
+            "entry count (%" PRIuS ")\n",
+            perm_u32.size(), sizes_u32.size());
     return false;
   }
-  bw.WriteBool(false);
+  if (!IsValidPermutation(perm_u32, sizes_u32.size())) {
+    fprintf(stderr, "jxltran: invalid TOC permutation for re-encode\n");
+    return false;
+  }
+  std::vector<HybridTok> toks;
+  if (!BuildTocPermHybridToks(sizes_u32.size(), perm_u32, &toks)) {
+    fprintf(stderr, "jxltran: could not build Lehmer code for TOC permutation\n");
+    return false;
+  }
+  bw.WriteBool(true);
+  if (!WriteTocPermutationAnsEntropy(&bw, toks)) return false;
   bw.ZeroPadToByte();
+  for (uint32_t s : sizes_u32) {
+    WriteU32(bw, s, kTocDist[0], kTocDist[1], kTocDist[2], kTocDist[3]);
+  }
+  bw.ZeroPadToByte();
+  return true;
+}
+
+bool WriteTocSizeList(BitWriter& bw, const std::vector<uint32_t>& sizes_u32) {
   for (uint32_t s : sizes_u32) {
     WriteU32(bw, s, kTocDist[0], kTocDist[1], kTocDist[2], kTocDist[3]);
   }

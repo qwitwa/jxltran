@@ -219,7 +219,7 @@ struct ImageHeader {
   // block (not including the final byte-alignment padding).
   size_t icc_start_bit = 0;
   size_t icc_end_bit = 0;
-  std::vector<uint8_t> icc_bytes;  // decoded ICC profile data
+  std::vector<uint8_t> icc_bytes;  // ICC.1 profile bytes when expansion succeeds
 };
 
 // ── API

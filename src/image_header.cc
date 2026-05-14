@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "compressed_icc.h"
 #include "printf_macros.h"
 #include "entropy.h"
 #include "trace.h"
@@ -575,10 +576,19 @@ static bool ReadImageMetadata(BitReader& br, ImageHeader* hdr) {
   if (m->colour_encoding.want_icc) {
     hdr->icc_start_bit = br.pos();
     TraceReadField(hdr->icc_start_bit, "read.image.icc_entropy", "(start)");
-    if (!SkipICCStream(br, &hdr->icc_bytes)) return false;
+    std::vector<uint8_t> icc_predicted;
+    if (!SkipICCStream(br, &icc_predicted)) return false;
     hdr->icc_end_bit = br.pos();
+    hdr->icc_bytes.clear();
+    if (!UnpredictIccProfile(icc_predicted, &hdr->icc_bytes)) {
+      fprintf(stderr,
+              "jxltran: warning: ICC profile expansion failed; continuing with "
+              "entropy-decoded bytes only (embedded ICC export may be "
+              "unavailable).\n");
+      hdr->icc_bytes = std::move(icc_predicted);
+    }
     TraceReadField(hdr->icc_end_bit, "read.image.icc_entropy_end",
-                   "span_bits=%" PRIuS " decoded_bytes=%" PRIuS "",
+                   "span_bits=%" PRIuS " icc_profile_bytes=%" PRIuS "",
                    hdr->icc_end_bit - hdr->icc_start_bit, hdr->icc_bytes.size());
   }
   return br.ok();

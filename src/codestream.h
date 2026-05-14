@@ -20,10 +20,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "frame_header.h"
 #include "image_header.h"
+#include "lfglobal.h"
 
 namespace jxltran {
 
@@ -46,12 +48,22 @@ struct FramedUnit {
   // (used as |original_data| base for WriteFrameHeader verbatim RF/ICC bits).
   size_t original_frame_byte_offset = 0;
 
-  // TOC decoded for re-encode when frame header / TOC bit phase changes.
-  // Empty |toc_perm| means no permutation. Used to re-encode the TOC only when
-  // a non-empty permutation is present, WriteCodestream fails with an error
-  // (TOC permutation re-encode is not implemented in the standalone tool).
+  // TOC decoded for re-encode (bit-phase / photon-noise TOC rewrite). When
+  // |toc_strip_perm_reorder|, the frame body is rebuilt in logical section
+  // order and the rewritten TOC has no permutation. |toc_perm| empty means
+  // none in source.
   std::vector<uint32_t> toc_decoded_sizes;
-  std::vector<uint32_t> toc_perm;  // coeff_order_t values; empty if none
+  std::vector<uint32_t> toc_perm;  // perm[s] = logical TOC index of stream slot s
+  // When stripping TOC permutation, the body is still in original stream order
+  // until write. |toc_strip_stream_sizes| holds stream-slot sizes before the
+  // strip; |toc_strip_logical_to_stream| holds inv[L] = stream index of logical
+  // section L (same as inverting toc_perm).
+  std::vector<uint32_t> toc_strip_stream_sizes;
+  std::vector<size_t> toc_strip_logical_to_stream;
+  // Bits from the start of the TOC through padding before the first U32 size
+  // codeword (permutation flag + optional Lehmer entropy + pad). Zero when
+  // there is no TOC (num_toc_entries==0).
+  size_t toc_bits_before_sizes = 0;
 
   // Photon-noise DC-global splice (see ApplyPhotonNoiseIso). Patch point is an
   // absolute codestream bit index (from first codestream byte = bit 0).
@@ -60,6 +72,40 @@ struct FramedUnit {
   size_t photon_noise_patch_abs_bit = 0;
   std::array<uint8_t, 10> photon_noise_new_bytes = {};
   bool photon_noise_toc_reencode = false;
+
+  // Absolute codestream bit index of the first bit of the 80-bit photon-noise
+  // LUT in DC global (after patches/splines). Filled by ReadCodestream when the
+  // LF-global prefix parses; used by ApplyPhotonNoiseIso.
+  size_t lf_global_noise_lut_abs_bit = 0;
+  bool lf_global_noise_lut_abs_valid = false;
+  // Offset in bits from the start of the LF-global TOC section to the first bit
+  // of the 80-bit LUT (or insert point when adding noise). Set with abs_valid.
+  size_t lf_global_noise_lut_rel_bit = 0;
+  // LF-global spline entropy region (bit indices; end exclusive). Valid after
+  // a successful LF-global prefix parse: if kFrameFlagSplines and splines were
+  // decoded, this spans the existing bundle; if the splines flag was clear,
+  // start==end and marks the bit position where a new spline bundle is inserted
+  // (before the noise LUT / following data).
+  bool lf_global_spline_region_valid = false;
+  size_t lf_global_spline_region_abs_start_bit = 0;
+  size_t lf_global_spline_region_abs_end_bit = 0;
+  // Same offsets relative to the first byte of logical TOC section 0 (LF
+  // global bundle).
+  size_t lf_global_spline_rel_start_bit = 0;
+  size_t lf_global_spline_rel_end_bit = 0;
+  // Decoded splines when the bitstream contained a spline bundle at read time.
+  std::optional<LfGlobalSplines> lf_global_splines;
+  // Re-encoded spline entropy (LF-global bit range); see ApplySplinesFromFile.
+  bool spline_edit = false;
+  int64_t spline_edit_delta_bits = 0;
+  std::vector<uint8_t> spline_edit_new_mid_bytes;
+  size_t spline_edit_new_mid_bits = 0;
+  bool spline_edit_toc_reencode = false;
+
+  // When true, WriteCodestream rebuilds the frame body in logical TOC order
+  // and rewrites the TOC without permutation (e.g. --group_order=0 or
+  // progressive normalization).
+  bool toc_strip_perm_reorder = false;
 };
 
 struct ParsedCodestream {

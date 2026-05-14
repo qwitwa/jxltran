@@ -367,10 +367,8 @@ void ReorderBoxes(std::vector<JxlBox>* boxes, BoxOrder order,
 
 #ifdef JXLTRAN_HAVE_BROTLI
 
-namespace {
-
-bool BrotliDecompress(const uint8_t* in, size_t in_size,
-                      std::vector<uint8_t>* out) {
+static bool BrotliDecompress(const uint8_t* in, size_t in_size,
+                             std::vector<uint8_t>* out) {
   BrotliDecoderState* st =
       BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
   if (!st) return false;
@@ -383,7 +381,7 @@ bool BrotliDecompress(const uint8_t* in, size_t in_size,
     size_t avail_out = out->size() - total;
     uint8_t* next_out = out->data() + total;
     r = BrotliDecoderDecompressStream(st, &avail_in, &next_in, &avail_out,
-                                      &next_out, &total);
+                                        &next_out, &total);
     if (r == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT)
       out->resize(out->size() * 2);
   } while (r == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT);
@@ -396,8 +394,8 @@ bool BrotliDecompress(const uint8_t* in, size_t in_size,
   return true;
 }
 
-bool BrotliCompress(const uint8_t* in, size_t in_size,
-                    std::vector<uint8_t>* out) {
+static bool BrotliCompress(const uint8_t* in, size_t in_size,
+                           std::vector<uint8_t>* out) {
   size_t max_out = BrotliEncoderMaxCompressedSize(in_size);
   out->resize(max_out);
   size_t out_size = max_out;
@@ -410,8 +408,6 @@ bool BrotliCompress(const uint8_t* in, size_t in_size,
   out->resize(out_size);
   return true;
 }
-
-}  // namespace
 
 bool DecompressBrobBoxes(std::vector<JxlBox>* boxes) {
   for (auto& box : *boxes) {
@@ -469,6 +465,90 @@ bool CompressMetadataBoxes(std::vector<JxlBox>* boxes,
   return true;
 }
 
+bool ExtractMetadataPayloadToBuffer(const std::vector<JxlBox>& boxes,
+                                    const char want_type[4],
+                                    std::vector<uint8_t>* payload) {
+  payload->clear();
+  for (const JxlBox& box : boxes) {
+    const char* eff = box.type;
+    const uint8_t* brob_in = nullptr;
+    size_t brob_len = 0;
+    if (memcmp(box.type, "brob", 4) == 0) {
+      if (box.data.size() < 4) continue;
+      eff = reinterpret_cast<const char*>(box.data.data());
+      brob_in = box.data.data() + 4;
+      brob_len = box.data.size() - 4;
+    }
+    if (memcmp(eff, want_type, 4) != 0) continue;
+    if (memcmp(box.type, "brob", 4) == 0) {
+      if (!BrotliDecompress(brob_in, brob_len, payload)) return false;
+    } else {
+      *payload = box.data;
+    }
+    return true;
+  }
+  fprintf(stderr,
+          "jxltran: no metadata box of type '%.4s' found in container\n",
+          want_type);
+  return false;
+}
+
 #endif  // JXLTRAN_HAVE_BROTLI
+
+#ifndef JXLTRAN_HAVE_BROTLI
+
+bool ExtractMetadataPayloadToBuffer(const std::vector<JxlBox>& boxes,
+                                    const char want_type[4],
+                                    std::vector<uint8_t>* payload) {
+  payload->clear();
+  for (const JxlBox& box : boxes) {
+    const char* eff = box.type;
+    if (memcmp(box.type, "brob", 4) == 0) {
+      if (box.data.size() < 4) continue;
+      eff = reinterpret_cast<const char*>(box.data.data());
+    }
+    if (memcmp(eff, want_type, 4) != 0) continue;
+    if (memcmp(box.type, "brob", 4) == 0) {
+      fprintf(stderr,
+              "jxltran: metadata is inside a brob box; rebuild jxltran with "
+              "brotli (libbrotli) to decompress it.\n");
+      return false;
+    }
+    *payload = box.data;
+    return true;
+  }
+  fprintf(stderr,
+          "jxltran: no metadata box of type '%.4s' found in container\n",
+          want_type);
+  return false;
+}
+
+#endif  // !JXLTRAN_HAVE_BROTLI
+
+void ReplaceMetadataBox(std::vector<JxlBox>* boxes, const char target_type[4],
+                        std::vector<uint8_t> payload) {
+  uint32_t strip_flag = 0;
+  if (memcmp(target_type, "Exif", 4) == 0) {
+    strip_flag = kStripExif;
+  } else if (memcmp(target_type, "xml ", 4) == 0) {
+    strip_flag = kStripXmp;
+  } else if (memcmp(target_type, "jumb", 4) == 0) {
+    strip_flag = kStripJumbf;
+  } else {
+    return;
+  }
+  StripBoxesByType(boxes, strip_flag);
+  JxlBox nb;
+  memcpy(nb.type, target_type, 4);
+  nb.data = std::move(payload);
+  for (size_t i = 0; i < boxes->size(); ++i) {
+    if (memcmp((*boxes)[i].type, "jxlc", 4) == 0 ||
+        memcmp((*boxes)[i].type, "jxlp", 4) == 0) {
+      boxes->insert(boxes->begin() + i, std::move(nb));
+      return;
+    }
+  }
+  boxes->push_back(std::move(nb));
+}
 
 }  // namespace jxltran

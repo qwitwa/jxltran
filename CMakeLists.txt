@@ -23,15 +23,21 @@ set(JXLTRAN_SOURCES
   "${JXLTRAN_SRC_DIR}/box.cc"
   "${JXLTRAN_SRC_DIR}/cmdline.cc"
   "${JXLTRAN_SRC_DIR}/codestream.cc"
+  "${JXLTRAN_SRC_DIR}/compressed_icc.cc"
   "${JXLTRAN_SRC_DIR}/entropy.cc"
   "${JXLTRAN_SRC_DIR}/frame_header.cc"
   "${JXLTRAN_SRC_DIR}/image_header.cc"
+  "${JXLTRAN_SRC_DIR}/lfglobal.cc"
   "${JXLTRAN_SRC_DIR}/jxltran.cc"
   "${JXLTRAN_SRC_DIR}/orientation_compose.cc"
   "${JXLTRAN_SRC_DIR}/photon_noise.cc"
   "${JXLTRAN_SRC_DIR}/operations.cc"
+  "${JXLTRAN_SRC_DIR}/opsin_adjust.cc"
   "${JXLTRAN_SRC_DIR}/restoration_filter.cc"
+  "${JXLTRAN_SRC_DIR}/spline_io.cc"
   "${JXLTRAN_SRC_DIR}/toc.cc"
+  "${JXLTRAN_SRC_DIR}/toc_group_order.cc"
+  "${JXLTRAN_SRC_DIR}/toc_layout.cc"
   "${JXLTRAN_SRC_DIR}/trace.cc"
 )
 
@@ -80,4 +86,29 @@ endif()
 
 if(NOT JXLTRAN_STANDALONE AND NOT SANITIZER STREQUAL "none")
   set_target_properties(jxltran PROPERTIES LINKER_LANGUAGE CXX)
+endif()
+
+# Rebuild web-demo/jxltran.js when sources change (same .cc tree as jxltran;
+# requires emcc on PATH). Incremental: only reruns if a dependency is newer
+# than web-demo/jxltran.js.
+if(JXLTRAN_STANDALONE)
+  find_program(JXLTRAN_EMCC NAMES emcc)
+  if(JXLTRAN_EMCC)
+    set(JXLTRAN_WEB_JS "${CMAKE_CURRENT_SOURCE_DIR}/web-demo/jxltran.js")
+    add_custom_command(
+      OUTPUT "${JXLTRAN_WEB_JS}"
+      COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/web-demo/build.sh"
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/web-demo"
+      DEPENDS ${JXLTRAN_SOURCES}
+              "${CMAKE_CURRENT_SOURCE_DIR}/web-demo/build.sh"
+      COMMENT "Emscripten: web-demo/jxltran.js")
+    add_custom_target(jxltran_wasm DEPENDS "${JXLTRAN_WEB_JS}")
+    add_dependencies(jxltran jxltran_wasm)
+    message(STATUS "jxltran: wasm web-demo tracks sources (emcc: ${JXLTRAN_EMCC})")
+  else()
+    message(
+      STATUS
+        "jxltran: emcc not found; skip web-demo auto-build (run web-demo/build.sh manually)"
+    )
+  endif()
 endif()

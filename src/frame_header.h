@@ -176,6 +176,31 @@ bool WriteFrameHeaderFromHaveCrop(BitWriter& bw, const FrameHeader& fh,
                                   const uint8_t* original_data,
                                   uint32_t canvas_w, uint32_t canvas_h);
 
+// Parsed frame dimensions used for TOC entry counts and layout labels
+// (matches libjxl FrameDimensions + NumTocEntries / AcGroupIndex).
+struct FrameTocMetrics {
+  size_t num_toc_entries = 0;
+  // True when num_groups==1 && num_passes==1 (single combined TOC section).
+  bool all_in_one_section = false;
+  size_t num_groups = 0;
+  size_t num_dc_groups = 0;
+  size_t num_passes = 1;
+  size_t group_dim = 0;
+  size_t xsize = 0;
+  size_t ysize = 0;
+  size_t xsize_blocks = 0;
+  size_t ysize_blocks = 0;
+  size_t xsize_groups = 0;
+  size_t ysize_groups = 0;
+  size_t xsize_dc_groups = 0;
+  size_t ysize_dc_groups = 0;
+};
+
+// Fills |out| from frame header + canvas (same geometry as libjxl ToFrameDimensions).
+void ComputeFrameTocMetrics(const FrameHeader& fh, const ImageMetadata& meta,
+                            uint32_t canvas_w, uint32_t canvas_h,
+                            FrameTocMetrics* out);
+
 // Parses the TOC that follows the frame header (toc.cc).
 // |br| must have consumed the frame header from the start of the frame span.
 // |frame_base|/|frame_len| are reserved for future bounds checks. On success,

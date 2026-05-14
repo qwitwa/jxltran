@@ -812,9 +812,30 @@ bool WriteFrameHeaderFromHaveCrop(BitWriter& bw, const FrameHeader& fh,
     TraceWriteField(p, "write.frame_tail.rf_and_extensions_verbatim",
                     "span_bits=%" PRIuS "", fh.rf_ext_end_bit - fh.rf_start_bit);
   } else {
+    // Packed read (no rf_start..rf_ext range in the source) or missing
+    // original: emit loop filter + frame-level extensions from parsed fields.
+    // A single WriteBool(true) is not enough — ReadFrameHeader always reads
+    // frame_extensions_mask (U64) after the restoration filter bundle.
+    const bool modular = (fh.encoding == kFrameEncModular);
     const size_t p = bw.bit_pos();
-    bw.WriteBool(true);
-    TraceWriteField(p, "write.frame_tail.rf_placeholder", "all_default=1");
+    if (!WriteParsedRestorationFilter(bw, modular, fh.restoration)) {
+      return false;
+    }
+    TraceWriteField(p, "write.frame_tail.restoration_filter",
+                    "span_bits=%" PRIuS "", bw.bit_pos() - p);
+    {
+      const size_t q = bw.bit_pos();
+      WriteU64(bw, fh.frame_extensions_mask);
+      TraceWriteField(q, "write.frame_tail.frame_extensions_mask",
+                      "mask=0x%" PRIx64 "", fh.frame_extensions_mask);
+    }
+    if (fh.frame_extensions_mask != 0) {
+      fprintf(stderr,
+              "jxltran: frame header extensions (mask non-zero) require "
+              "verbatim source bits; re-encode from parsed extensions is not "
+              "implemented\n");
+      return false;
+    }
   }
   return true;
 }
@@ -921,6 +942,25 @@ bool WriteFrameHeader(BitWriter& bw, const FrameHeader& fh,
 
 // ── NumTocEntries (matches lib/jxl/frame_dimensions.h + toc.h) ───────────
 
+// lib/jxl/frame_header.cc — YCbCrChromaSubsampling::kHShift / kVShift.
+static constexpr uint8_t kYCbCrSubsamplingH[4] = {0, 1, 1, 0};
+static constexpr uint8_t kYCbCrSubsamplingV[4] = {0, 1, 0, 1};
+
+static void ChromaMaxShiftFromJpegModes(const uint32_t mode[3], uint8_t* max_h,
+                                        uint8_t* max_v) {
+  uint8_t mh = 0, mv = 0;
+  for (int c = 0; c < 3; ++c) {
+    uint32_t m = mode[c];
+    if (m > 3) m = 0;
+    mh = static_cast<uint8_t>(
+        std::max<unsigned>(mh, kYCbCrSubsamplingH[m]));
+    mv = static_cast<uint8_t>(
+        std::max<unsigned>(mv, kYCbCrSubsamplingV[m]));
+  }
+  *max_h = mh;
+  *max_v = mv;
+}
+
 static constexpr size_t kFdBlockDim = 8;
 static constexpr size_t kFdGroupDim = 256;
 
@@ -935,12 +975,9 @@ static size_t NumTocEntriesFromGroups(size_t num_groups, size_t num_dc_groups,
   return AcGroupIndex(0, 0, num_groups, num_dc_groups) + num_groups * num_passes;
 }
 
-// Computes the number of TOC entries for a frame (must match libjxl
-// FrameHeader::ToFrameDimensions + NumTocEntries).
-static size_t ComputeNumTocEntries(const FrameHeader& fh,
-                                   const ImageMetadata& meta, uint32_t canvas_w,
-                                   uint32_t canvas_h) {
-  (void)meta;
+void ComputeFrameTocMetrics(const FrameHeader& fh, const ImageMetadata& meta,
+                            uint32_t canvas_w, uint32_t canvas_h,
+                            FrameTocMetrics* out) {
   size_t xsize_px = fh.have_crop ? fh.crop_width : canvas_w;
   size_t ysize_px = fh.have_crop ? fh.crop_height : canvas_h;
   if (fh.frame_type == kFrameTypeLF && fh.lf_level > 0) {
@@ -952,22 +989,39 @@ static size_t ComputeNumTocEntries(const FrameHeader& fh,
   uint32_t gs = fh.group_size_shift;
   if (gs > 3) gs = 3;
   uint8_t max_h = 0, max_v = 0;
+  const bool use_lf_frame = (fh.flags & kFlagUseLfFrame) != 0;
+  if (!meta.xyb_encoded && fh.do_YCbCr && !use_lf_frame) {
+    ChromaMaxShiftFromJpegModes(fh.jpeg_upsampling, &max_h, &max_v);
+  }
 
-  const size_t group_dim = (kFdGroupDim >> 1) << gs;
-  const size_t xsize = DivCeil(xsize_px, static_cast<size_t>(up));
-  const size_t ysize = DivCeil(ysize_px, static_cast<size_t>(up));
-  size_t xsize_blocks =
-      DivCeil(xsize, static_cast<size_t>(kFdBlockDim << max_h)) << max_h;
-  size_t ysize_blocks =
-      DivCeil(ysize, static_cast<size_t>(kFdBlockDim << max_v)) << max_v;
-  const size_t xsize_groups = DivCeil(xsize, group_dim);
-  const size_t ysize_groups = DivCeil(ysize, group_dim);
-  const size_t xsize_dc_groups = DivCeil(xsize_blocks, group_dim);
-  const size_t ysize_dc_groups = DivCeil(ysize_blocks, group_dim);
-  const size_t num_groups = xsize_groups * ysize_groups;
-  const size_t num_dc_groups = xsize_dc_groups * ysize_dc_groups;
-  const size_t num_passes = fh.passes.num_passes;
-  return NumTocEntriesFromGroups(num_groups, num_dc_groups, num_passes);
+  out->group_dim = (kFdGroupDim >> 1) << gs;
+  out->xsize = DivCeil(xsize_px, static_cast<size_t>(up));
+  out->ysize = DivCeil(ysize_px, static_cast<size_t>(up));
+  out->xsize_blocks =
+      DivCeil(out->xsize, static_cast<size_t>(kFdBlockDim << max_h)) << max_h;
+  out->ysize_blocks =
+      DivCeil(out->ysize, static_cast<size_t>(kFdBlockDim << max_v)) << max_v;
+  out->xsize_groups = DivCeil(out->xsize, out->group_dim);
+  out->ysize_groups = DivCeil(out->ysize, out->group_dim);
+  out->xsize_dc_groups = DivCeil(out->xsize_blocks, out->group_dim);
+  out->ysize_dc_groups = DivCeil(out->ysize_blocks, out->group_dim);
+  out->num_groups = out->xsize_groups * out->ysize_groups;
+  out->num_dc_groups = out->xsize_dc_groups * out->ysize_dc_groups;
+  out->num_passes = fh.passes.num_passes;
+  out->all_in_one_section =
+      (out->num_groups == 1 && out->num_passes == 1);
+  out->num_toc_entries =
+      NumTocEntriesFromGroups(out->num_groups, out->num_dc_groups, out->num_passes);
+}
+
+// Computes the number of TOC entries for a frame (must match libjxl
+// FrameHeader::ToFrameDimensions + NumTocEntries).
+static size_t ComputeNumTocEntries(const FrameHeader& fh,
+                                   const ImageMetadata& meta, uint32_t canvas_w,
+                                   uint32_t canvas_h) {
+  FrameTocMetrics m;
+  ComputeFrameTocMetrics(fh, meta, canvas_w, canvas_h, &m);
+  return m.num_toc_entries;
 }
 
 bool ReadFrameTOC(BitReader& br, const FrameHeader& fh,
@@ -981,6 +1035,7 @@ bool ReadFrameTOC(BitReader& br, const FrameHeader& fh,
       fu->toc_bit_length = 0;
       fu->toc_decoded_sizes.clear();
       fu->toc_perm.clear();
+      fu->toc_bits_before_sizes = 0;
     }
     return true;
   }
@@ -995,7 +1050,8 @@ bool ReadFrameTOC(BitReader& br, const FrameHeader& fh,
     jr.SkipBits(toc_p);
     std::vector<uint32_t> sizes;
     std::vector<uint32_t> perm;
-    if (!ReadFullToc(jr, n, &total, &sizes, &perm)) {
+    if (!ReadFullToc(jr, n, &total, &sizes, &perm,
+                      fu != nullptr ? &fu->toc_bits_before_sizes : nullptr)) {
       return false;
     }
     toc_bits = jr.pos() - toc_p;

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <string>
 #include <vector>
 
 #include "box.h"
@@ -25,8 +26,12 @@
 #include "codestream.h"
 #include "image_header.h"
 #include "operations.h"
+#include "opsin_adjust.h"
 #include "orientation_compose.h"
 #include "printf_macros.h"
+#include "spline_io.h"
+#include "toc_group_order.h"
+#include "toc_layout.h"
 #include "trace.h"
 
 namespace {
@@ -34,6 +39,24 @@ namespace {
 // CLI value meaning "leave unchanged". Legacy alias "as-is" is still accepted.
 static bool ParseKeepToken(const char* str) {
   return strcmp(str, "keep") == 0 || strcmp(str, "as-is") == 0;
+}
+
+static bool StoreExtractIccPath(const char* s, const char** out) {
+  *out = s;
+  return true;
+}
+
+// Reject entropy-decoded ICC codec bytes when expansion failed (varint preamble).
+static bool IccBytesLookLikeIcc1(const std::vector<uint8_t>& icc) {
+  if (icc.size() < 128) return false;
+  if ((icc[0] & 0x80) != 0) return false;
+  for (size_t i = 0; i + 4 <= icc.size() && i < 128; ++i) {
+    if (icc[i] == 'a' && icc[i + 1] == 'c' && icc[i + 2] == 's' &&
+        icc[i + 3] == 'p') {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool ReadFile(const char* path, std::vector<uint8_t>* out) {
@@ -296,6 +319,46 @@ static bool ParseBitsPerSampleOpt(const char* s, uint32_t* out) {
   }
   *out = static_cast<uint32_t>(v);
   return true;
+}
+
+struct OpsinFloatOpt {
+  bool set = false;
+  float value = 0.f;
+};
+
+static bool ParseOpsinSlider(const char* s, OpsinFloatOpt* out, const char* flag,
+                             float min_v, float max_v) {
+  char* end = nullptr;
+  const float v = strtof(s, &end);
+  if (end == s || *end != '\0') {
+    fprintf(stderr, "jxltran: %s: expected a number, got '%s'\n", flag, s);
+    return false;
+  }
+  if (v < min_v || v > max_v) {
+    fprintf(stderr, "jxltran: %s: value %g out of range [%g, %g]\n", flag,
+            static_cast<double>(v), static_cast<double>(min_v),
+            static_cast<double>(max_v));
+    return false;
+  }
+  out->set = true;
+  out->value = v;
+  return true;
+}
+
+static bool ParseOpsinExposureOpt(const char* s, OpsinFloatOpt* out) {
+  return ParseOpsinSlider(s, out, "--opsin-exposure", -10.f, 10.f);
+}
+
+static bool ParseOpsinTempOpt(const char* s, OpsinFloatOpt* out) {
+  return ParseOpsinSlider(s, out, "--opsin-temperature", -100.f, 100.f);
+}
+
+static bool ParseOpsinTintOpt(const char* s, OpsinFloatOpt* out) {
+  return ParseOpsinSlider(s, out, "--opsin-tint", -100.f, 100.f);
+}
+
+static bool ParseOpsinHueOpt(const char* s, OpsinFloatOpt* out) {
+  return ParseOpsinSlider(s, out, "--opsin-hue", -100.f, 100.f);
 }
 
 struct NumLoopsArg {
@@ -565,6 +628,95 @@ static bool ParsePhotonIsoOpt(const char* s, PhotonIsoArg* out) {
   return true;
 }
 
+struct FramesArg {
+  bool set = false;
+  std::vector<size_t> indices;
+};
+
+static bool ParseFramesArg(const char* s, FramesArg* out) {
+  out->set = true;
+  out->indices.clear();
+  if (s == nullptr || s[0] == '\0') {
+    fprintf(stderr,
+            "jxltran: --frames expects a comma-separated list of non-negative "
+            "integers (codestream frame indices, 0-based)\n");
+    return false;
+  }
+  const char* p = s;
+  while (*p != '\0') {
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') break;
+    char* end = nullptr;
+    unsigned long v = strtoul(p, &end, 10);
+    if (end == p) {
+      fprintf(stderr, "jxltran: --frames: invalid integer near '%s'\n", p);
+      return false;
+    }
+    if (v > static_cast<unsigned long>(
+            (std::numeric_limits<size_t>::max)())) {
+      fprintf(stderr, "jxltran: --frames: frame index out of range near '%s'\n",
+              p);
+      return false;
+    }
+    out->indices.push_back(static_cast<size_t>(v));
+    p = end;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == ',') {
+      ++p;
+      continue;
+    }
+    if (*p == '\0') break;
+    fprintf(stderr,
+            "jxltran: --frames: expected end of list or ',' before '%s'\n", p);
+    return false;
+  }
+  if (out->indices.empty()) {
+    fprintf(stderr, "jxltran: --frames needs at least one frame index\n");
+    return false;
+  }
+  std::sort(out->indices.begin(), out->indices.end());
+  out->indices.erase(std::unique(out->indices.begin(), out->indices.end()),
+                     out->indices.end());
+  return true;
+}
+
+static bool ParseGroupOrder(const char* s, jxltran::TocGroupOrderCli* out) {
+  if (strcmp(s, "keep") == 0) {
+    *out = jxltran::TocGroupOrderCli::kKeep;
+    return true;
+  }
+  if (strcmp(s, "0") == 0) {
+    *out = jxltran::TocGroupOrderCli::kCanonical;
+    return true;
+  }
+  if (strcmp(s, "1") == 0) {
+    fprintf(stderr,
+            "jxltran: --group_order=1 is not implemented yet (requires "
+            "reordering frame body bytes to match a new TOC permutation).\n");
+    return false;
+  }
+  if (strcmp(s, "progressive") == 0) {
+    *out = jxltran::TocGroupOrderCli::kProgressive;
+    return true;
+  }
+  fprintf(stderr,
+          "jxltran: --group_order expects keep|0|progressive (1 not yet "
+          "supported), got '%s'\n",
+          s);
+  return false;
+}
+
+static bool ParseCenterI64(const char* s, int64_t* out) {
+  char* end = nullptr;
+  const long long v = strtoll(s, &end, 10);
+  if (end == s || *end != '\0') {
+    fprintf(stderr, "jxltran: expected integer, got '%s'\n", s);
+    return false;
+  }
+  *out = static_cast<int64_t>(v);
+  return true;
+}
+
 struct Args {
   const char* file_in = nullptr;
   const char* file_out = nullptr;
@@ -579,11 +731,28 @@ struct Args {
   uint32_t set_bits_per_sample = 0;  // 0 = no change; only for xyb_encoded
   NumLoopsArg num_loops;
   TpsArg tps;
+  OpsinFloatOpt opsin_exposure;
+  OpsinFloatOpt opsin_temperature;
+  OpsinFloatOpt opsin_tint;
+  OpsinFloatOpt opsin_hue;
   CropArg crop;
+  FramesArg frames;
+  jxltran::TocGroupOrderCli group_order = jxltran::TocGroupOrderCli::kKeep;
+  int64_t center_x = -1;
+  int64_t center_y = -1;
   PhotonIsoArg photon_iso;
   const char* gab_blur = nullptr;
   const char* gab_sharpen = nullptr;
   const char* gab_weights = nullptr;
+  const char* extract_icc = nullptr;
+  const char* extract_exif = nullptr;
+  const char* extract_xmp = nullptr;
+  const char* extract_jumbf = nullptr;
+  const char* extract_splines = nullptr;
+  const char* set_splines_from = nullptr;
+  const char* set_exif = nullptr;
+  const char* set_xmp = nullptr;
+  const char* set_jumbf = nullptr;
   bool verbose = false;
 
   int GabOptionCount() const {
@@ -596,14 +765,22 @@ struct Args {
            set_bits_per_sample != 0 || num_loops.set || tps.set;
   }
 
+  bool NeedsOpsinAdjust() const {
+    return opsin_exposure.set || opsin_temperature.set || opsin_tint.set ||
+           opsin_hue.set;
+  }
+
   bool NeedsPhotonNoiseIso() const { return photon_iso.set; }
+
+  bool NeedsSplinesSet() const { return set_splines_from != nullptr; }
 
   void AddCommandLineOptions(jpegxl::tools::CommandLineParser* cmdline) {
     cmdline->AddPositionalOption("INPUT", /*required=*/true,
                                  "The JPEG XL input file.", &file_in);
     cmdline->AddPositionalOption(
         "OUTPUT", /*required=*/false,
-        "The JPEG XL output file (omit with --info).", &file_out);
+        "The JPEG XL output file (omit with --info or --extract-icc).",
+        &file_out);
     cmdline->AddHelpText("\nOutput options:", 0);
     cmdline->AddOptionValue(
         '\0', "container", "keep|no|yes|if-needed",
@@ -705,11 +882,34 @@ struct Args {
         "Set the animation ticks-per-second.\n"
         "  Absolute: N or N/D (positive integers), e.g. 24, 25, 30, 60, or\n"
         "            30000/1001 (NTSC).\n"
-        "  Relative: P%% scales the file's current TPS (from the image "
+        "  Relative: P% scales the file's current TPS (from the image "
         "header),\n"
-        "            e.g. 50%% for half speed, 200%% for double.\n"
+        "            e.g. 50% for half speed, 200% for double.\n"
         "Only valid for animated images (have_animation=true).",
         &tps, ParseTpsOpt);
+    cmdline->AddOptionValue(
+        '\0', "opsin-exposure", "EV",
+        "XYB only: exposure in stops (linear RGB after XYB→RGB). Reversible via\n"
+        "    a non-default OpsinInverseMatrix (CustomTransformData). Range about "
+        "±10.\n"
+        "    Combine with --opsin-temperature / --opsin-tint / --opsin-hue.",
+        &opsin_exposure, ParseOpsinExposureOpt);
+    cmdline->AddOptionValue(
+        '\0', "opsin-temperature", "T",
+        "XYB only: white balance warmth in arbitrary units −100..+100 (warm = "
+        "positive).\n"
+        "    Applied on the decoder inverse opsin matrix (like a Lightroom "
+        "Temperature slider).",
+        &opsin_temperature, ParseOpsinTempOpt);
+    cmdline->AddOptionValue(
+        '\0', "opsin-tint", "T",
+        "XYB only: green vs magenta tint, −100..+100 (green = positive).",
+        &opsin_tint, ParseOpsinTintOpt);
+    cmdline->AddOptionValue(
+        '\0', "opsin-hue", "T",
+        "XYB only: small hue rotation in the linear R–B plane, −100..+100 "
+        "(~±5° at extremes).",
+        &opsin_hue, ParseOpsinHueOpt);
     cmdline->AddHelpText("\nCrop options:", 0);
     cmdline->AddOptionValue(
         '\0', "crop", "WxH or WxHXY",
@@ -732,27 +932,69 @@ struct Args {
         "compressed\n"
         "sample data is re-encoded.",
         &crop, ParseCropOpt);
-    cmdline->AddHelpText("\nPhoton noise (VarDCT) options:", 0);
+    cmdline->AddHelpText(
+        "\nFrame-level codestream edits (TOC order, Gaborish, photon noise):",
+        0);
+    cmdline->AddOptionValue(
+        '\0', "frames", "N[,N...]",
+        "Apply the frame-level operations below only to the listed codestream "
+        "frame\n"
+        "indices (0-based, in codestream order; match the first number on each\n"
+        "`frame_region:` line from --info). Omit --frames to affect every "
+        "regular or\n"
+        "skip-progressive frame (LF and reference-only frames are always left "
+        "unchanged).",
+        &frames, ParseFramesArg);
+    cmdline->AddOptionValue(
+        '\0', "group_order", "keep|0|progressive",
+        "TOC section order in regular / skip-progressive frames.\n"
+        "    keep         : leave permutation and sizes unchanged.\n"
+        "    0            : strip TOC permutation (logical order in the "
+        "bitstream).\n"
+        "    progressive  : if stream order is non-progressive (HF spatial "
+        "groups appear\n"
+        "                   before lf_global and every lf_group have been "
+        "signaled),\n"
+        "                   strip permutation like 0; otherwise keep (e.g. "
+        "center-first\n"
+        "                   order that still signals all LF data before HF). "
+        "--group_order=1\n"
+        "                   is not implemented yet.",
+        &group_order, ParseGroupOrder);
+    cmdline->AddOptionValue(
+        '\0', "center_x", "X",
+        "With --group_order=1 (not implemented), image X coordinate for "
+        "spiral center\n"
+        "(-1 = image center, matching cjxl). Ignored for other modes.",
+        &center_x, ParseCenterI64);
+    cmdline->AddOptionValue(
+        '\0', "center_y", "Y",
+        "With --group_order=1 (not implemented), image Y coordinate for "
+        "spiral center\n"
+        "(-1 = image center). Ignored for other modes.",
+        &center_y, ParseCenterI64);
     cmdline->AddOptionValue(
         '\0', "set-photon-noise-iso", "ISO",
-        "Rewrite the synthetic noise LUT in each regular / skip-progressive "
-        "frame\n"
-        "using the same ISO-based model as libjxl (cjxl --photon_noise_iso). "
-        "0\n"
-        "clears the kNoise flag and removes the 80-bit LUT from DC global. "
-        "Requires\n"
-        "frames without patches or splines and, when the DC-global byte size "
+        "Rewrite the synthetic noise LUT in regular / skip-progressive frames "
+        "(modular\n"
+        "or VarDCT), using the same ISO-based model as libjxl "
+        "(cjxl --photon_noise_iso).\n"
+        "0 clears the kNoise flag and removes the 80-bit LUT from DC global. "
+        "Each\n"
+        "edited frame must have no patches or splines. When DC-global size "
         "changes,\n"
-        "a TOC without permutation. Compressed sample values are unchanged.",
+        "the TOC permutation entropy is copied verbatim from the input and only "
+        "the\n"
+        "U32 size codewords are re-encoded. Compressed sample values are "
+        "unchanged.",
         &photon_iso, ParsePhotonIsoOpt);
-    cmdline->AddHelpText("\nGaborish (restoration filter) options:", 0);
     cmdline->AddOptionValue(
         '\0', "gab-blur", "A",
         "Stronger reversible Gaborish blur than the encoder default (A>=0).\n"
         "Uses the same unnormalized gab_x/y/b_weight1 and weight2 on all "
         "channels,\n"
         "scaled from libjxl defaults. Requires explicit frame headers; LF and\n"
-        "reference-only frames are unchanged. Mutually exclusive with "
+        "reference-only frames are skipped. Mutually exclusive with "
         "--gab-sharpen and --gab-weights.",
         &gab_blur, StoreGabStringArg);
     cmdline->AddOptionValue(
@@ -762,16 +1004,19 @@ struct Args {
         "gab_*_weight1/2 lower and can make them slightly negative for "
         "stronger\n"
         "sharpening; libjxl rejects only near-singular kernels where\n"
-        "|1+4*(weight1+weight2)| < 1e-8 per channel. Mutually exclusive with\n"
-        "--gab-blur and --gab-weights.",
+        "|1+4*(weight1+weight2)| < 1e-8 per channel. LF and reference-only "
+        "frames are\n"
+        "skipped. Mutually exclusive with --gab-blur and --gab-weights.",
         &gab_sharpen, StoreGabStringArg);
     cmdline->AddOptionValue(
         '\0', "gab-weights", "x1,x2,y1,y2,b1,b2",
         "Set all six Gaborish weights (comma-separated, unnormalized).\n"
         "Order: gab_x_weight1, gab_x_weight2, gab_y_weight1, gab_y_weight2,\n"
         "gab_b_weight1, gab_b_weight2. Values may be negative if each channel\n"
-        "still satisfies |1+4*(w1+w2)| >= 1e-8 after normalization. Mutually\n"
-        "exclusive with --gab-blur and --gab-sharpen.",
+        "still satisfies |1+4*(w1+w2)| >= 1e-8 after normalization. LF and\n"
+        "reference-only frames are skipped. Mutually exclusive with --gab-blur "
+        "and\n"
+        "--gab-sharpen.",
         &gab_weights, StoreGabStringArg);
     cmdline->AddHelpText("\nDebugging:", 0);
     cmdline->AddOptionFlag(
@@ -789,6 +1034,76 @@ struct Args {
         "orientation as dimensions), then exit. No OUTPUT file; cannot be "
         "combined with transform or remux options.",
         &info, &jpegxl::tools::SetBooleanTrue);
+    cmdline->AddOptionValue(
+        '\0', "extract-icc", "FILE",
+        "Write the codestream-embedded ICC profile to FILE (when present) and "
+        "exit. No OUTPUT file; same combination rules as --info (only "
+        "optional -v/--verbose).",
+        &extract_icc, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "extract-exif", "FILE",
+        "Write the first Exif box payload to FILE (raw TIFF Exif block) and "
+        "exit.\n"
+        "brob-wrapped Exif is decompressed when jxltran is built with brotli. "
+        "No\n"
+        "OUTPUT file; same combination rules as --extract-icc.",
+        &extract_exif, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "extract-xmp", "FILE",
+        "Write the first XMP metadata box (type xml ) payload to FILE and "
+        "exit.\n"
+        "brob-wrapped XMP is decompressed when built with brotli. No OUTPUT; "
+        "same\n"
+        "rules as --extract-icc.",
+        &extract_xmp, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "extract-jumbf", "FILE",
+        "Write the first JUMBF box (type jumb) payload to FILE and exit.\n"
+        "brob-wrapped JUMBF is decompressed when built with brotli. No OUTPUT; "
+        "same\n"
+        "rules as --extract-icc.",
+        &extract_jumbf, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "extract-splines", "FILE",
+        "Write LF-global spline geometry and quantized coefficients as text "
+        "and exit.\n"
+        "Format matches --set-splines-from. Optional --frames selects codestream "
+        "frames.\n"
+        "No OUTPUT; same combination rules as --extract-icc.",
+        &extract_splines, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "set-splines-from", "FILE",
+        "Replace LF-global spline bundles from FILE (from --extract-splines), or "
+        "insert\n"
+        "new splines when the frame has no kSplines flag (the flag is then set). "
+        "Requires\n"
+        "a successful LF-global prefix parse. Re-encoded spline entropy may use "
+        "any\n"
+        "bit length; the frame body stays byte-aligned with trailing zero bits "
+        "when\n"
+        "needed (downstream bit phase may shift). Not with photon-noise edit or\n"
+        "stripped TOC permutation on the same pass.",
+        &set_splines_from, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "set-exif", "FILE",
+        "Replace (or add) the Exif metadata box with the contents of FILE. "
+        "Removes\n"
+        "any existing Exif and brob-wrapped Exif boxes. Bare codestream input is "
+        "wrapped\n"
+        "in a minimal container.",
+        &set_exif, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "set-xmp", "FILE",
+        "Replace (or add) the XMP box (xml ) with the contents of FILE; same "
+        "semantics\n"
+        "as --set-exif.",
+        &set_xmp, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "set-jumbf", "FILE",
+        "Replace (or add) the JUMBF box (jumb) with the contents of FILE; same "
+        "semantics\n"
+        "as --set-exif.",
+        &set_jumbf, StoreExtractIccPath);
   }
 };
 
@@ -800,9 +1115,11 @@ static bool InfoModeUsesNonDefaultOptions(const Args& a) {
          a.box_order.order != jxltran::BoxOrder::kAsIs ||
          a.brob.mode != jxltran::BrobOpt::kAsIs || a.set_orientation != 0 ||
          a.rel_orientation != 0 || a.set_bits_per_sample != 0 ||
-         a.num_loops.set || a.tps.set || a.crop.set || a.photon_iso.set ||
-         a.gab_blur != nullptr || a.gab_sharpen != nullptr ||
-         a.gab_weights != nullptr;
+         a.num_loops.set || a.tps.set || a.crop.set || a.frames.set ||
+         a.group_order != jxltran::TocGroupOrderCli::kKeep || a.photon_iso.set ||
+         a.set_splines_from != nullptr || a.gab_blur != nullptr ||
+         a.gab_sharpen != nullptr || a.gab_weights != nullptr ||
+         a.NeedsOpsinAdjust();
 }
 
 static void PrintJxlInfoStdout(const jxltran::ParsedCodestream& parsed) {
@@ -816,6 +1133,8 @@ static void PrintJxlInfoStdout(const jxltran::ParsedCodestream& parsed) {
   printf("dimensions: %u x %u\n", dw, dh);
   printf("animation: %s\n",
          parsed.image.metadata.have_animation ? "yes" : "no");
+  printf("xyb_encoded: %s\n",
+         parsed.image.metadata.xyb_encoded ? "yes" : "no");
 
   for (size_t i = 0; i < parsed.frames.size(); ++i) {
     const jxltran::FrameHeader& fh = parsed.frames[i].frame;
@@ -852,6 +1171,8 @@ static void PrintJxlInfoStdout(const jxltran::ParsedCodestream& parsed) {
     } else {
       printf("%" PRId64 "\n", dy);
     }
+    printf("frame_upsampling: %" PRIuS " %u\n", i,
+           std::max<uint32_t>(1u, fh.upsampling));
   }
 }
 
@@ -868,10 +1189,33 @@ int main(int argc, const char* argv[]) {
     cmdline.PrintHelp();
     return 0;
   }
+  const bool meta_extract = args.extract_exif != nullptr ||
+                            args.extract_xmp != nullptr ||
+                            args.extract_jumbf != nullptr;
+  const bool meta_set = args.set_exif != nullptr || args.set_xmp != nullptr ||
+                         args.set_jumbf != nullptr;
   if (args.GabOptionCount() > 1) {
     fprintf(stderr,
             "jxltran: use at most one of --gab-blur, --gab-sharpen, "
             "--gab-weights\n");
+    return 1;
+  }
+  if (args.frames.set && args.GabOptionCount() == 0 &&
+      !args.NeedsPhotonNoiseIso() && !args.NeedsSplinesSet() &&
+      args.group_order == jxltran::TocGroupOrderCli::kKeep) {
+    fprintf(stderr,
+            "jxltran: --frames requires at least one of --gab-blur, "
+            "--gab-sharpen, --gab-weights, --set-photon-noise-iso, "
+            "--set-splines-from, or a\n"
+            "non-default --group_order\n");
+    return 1;
+  }
+  if ((args.extract_exif && args.set_exif) ||
+      (args.extract_xmp && args.set_xmp) ||
+      (args.extract_jumbf && args.set_jumbf)) {
+    fprintf(stderr,
+            "jxltran: cannot combine --extract-* and --set-* for the same "
+            "metadata type.\n");
     return 1;
   }
   if (args.set_orientation != 0 && args.rel_orientation != 0) {
@@ -880,18 +1224,33 @@ int main(int argc, const char* argv[]) {
             "--set-orientation-relative\n");
     return 1;
   }
-  if (args.info && args.file_out) {
+  if ((args.info || args.extract_icc || args.extract_splines || meta_extract) &&
+      args.file_out) {
     fprintf(stderr,
-            "jxltran: --info does not take an output file; omit OUTPUT.\n");
+            "jxltran: --info and --extract-* options do not take an output file; "
+            "omit OUTPUT.\n");
     return 1;
   }
-  if (args.info && InfoModeUsesNonDefaultOptions(args)) {
+  if ((args.info || args.extract_icc || args.extract_splines || meta_extract) &&
+      InfoModeUsesNonDefaultOptions(args)) {
     fprintf(stderr,
-            "jxltran: --info cannot be combined with other options (only "
-            "optional -v/--verbose).\n");
+            "jxltran: --info and --extract-* cannot be combined with other "
+            "options (only optional -v/--verbose).\n");
     return 1;
   }
-  if (!args.info && !args.file_out) {
+  if (meta_set && (args.info || args.extract_icc || meta_extract)) {
+    fprintf(stderr,
+            "jxltran: --set-exif/--set-xmp/--set-jumbf cannot be combined with "
+            "--info, --extract-icc, or --extract-exif/xmp/jumbf.\n");
+    return 1;
+  }
+  if (meta_set && !args.file_out) {
+    fprintf(stderr,
+            "jxltran: --set-exif, --set-xmp, and --set-jumbf require OUTPUT.\n");
+    return 1;
+  }
+  if (!args.info && !args.file_out && !args.extract_icc &&
+      !args.extract_splines && !meta_extract) {
     fprintf(stderr, "No output file specified.\n");
     return 1;
   }
@@ -910,6 +1269,7 @@ int main(int argc, const char* argv[]) {
   if (!ReadFile(args.file_in, &input)) return 1;
 
   bool is_container = jxltran::IsJxlContainer(input.data(), input.size());
+  const bool input_was_container = is_container;
   bool is_codestream = jxltran::IsJxlCodestream(input.data(), input.size());
 
   if (!is_container && !is_codestream) {
@@ -927,16 +1287,94 @@ int main(int argc, const char* argv[]) {
     codestream = input;
   }
 
-  if (args.info) {
-    std::vector<uint8_t> cs;
-    if (is_container) {
-      if (!jxltran::ReassembleCodestream(boxes, &cs)) return 1;
-    } else {
-      cs = std::move(codestream);
+  if (meta_set && !input_was_container) {
+    jxltran::JxlBox jxl_magic;
+    memcpy(jxl_magic.type, "JXL ", 4);
+    jxl_magic.data.assign({0x0d, 0x0a, 0x87, 0x0a});
+    jxltran::JxlBox ftyp;
+    memcpy(ftyp.type, "ftyp", 4);
+    ftyp.data.assign({'j', 'x', 'l', ' ', 0, 0, 0, 0, 'j', 'x', 'l', ' '});
+    jxltran::JxlBox jxlc;
+    memcpy(jxlc.type, "jxlc", 4);
+    jxlc.data = std::move(codestream);
+    boxes.push_back(std::move(jxl_magic));
+    boxes.push_back(std::move(ftyp));
+    boxes.push_back(std::move(jxlc));
+    is_container = true;
+  }
+
+  if (args.info || args.extract_icc || args.extract_splines || meta_extract) {
+    if (meta_extract && !input_was_container) {
+      fprintf(stderr,
+              "jxltran: --extract-exif, --extract-xmp, and --extract-jumbf "
+              "require a JXL container input.\n");
+      return 1;
     }
-    jxltran::ParsedCodestream parsed;
-    if (!jxltran::ReadCodestream(cs.data(), cs.size(), &parsed)) return 1;
-    PrintJxlInfoStdout(parsed);
+    if (args.info || args.extract_icc || args.extract_splines) {
+      std::vector<uint8_t> cs;
+      if (input_was_container) {
+        if (!jxltran::ReassembleCodestream(boxes, &cs)) return 1;
+      } else {
+        cs = std::move(codestream);
+      }
+      jxltran::ParsedCodestream parsed;
+      if (!jxltran::ReadCodestream(cs.data(), cs.size(), &parsed)) return 1;
+      if (args.extract_icc) {
+        if (!parsed.image.metadata.colour_encoding.want_icc) {
+          fprintf(stderr,
+                  "jxltran: codestream has no embedded ICC profile "
+                  "(colour_encoding.want_icc is false).\n");
+          return 1;
+        }
+        if (!IccBytesLookLikeIcc1(parsed.image.icc_bytes)) {
+          fprintf(stderr,
+                  "jxltran: embedded ICC could not be expanded to a valid ICC.1 "
+                  "profile (internal ICC codec mismatch).\n");
+          return 1;
+        }
+        if (!WriteFile(args.extract_icc, parsed.image.icc_bytes)) return 1;
+      }
+      if (args.extract_splines) {
+        std::string text;
+        const std::vector<size_t>* fsel =
+            args.frames.set ? &args.frames.indices : nullptr;
+        if (!jxltran::SplinesTextFromCodestream(parsed, fsel, &text)) {
+          fprintf(stderr,
+                  "jxltran: no spline text to write (no matching frames with "
+                  "splines, or parse error).\n");
+          return 1;
+        }
+        std::vector<uint8_t> bytes(text.begin(), text.end());
+        if (!WriteFile(args.extract_splines, bytes)) return 1;
+      }
+      if (args.info) {
+        PrintJxlInfoStdout(parsed);
+        if (args.verbose) {
+          jxltran::PrintCodestreamTocLayoutVerbose(stdout, parsed);
+        }
+      }
+    }
+    if (meta_extract) {
+      std::vector<uint8_t> payload;
+      if (args.extract_exif) {
+        if (!jxltran::ExtractMetadataPayloadToBuffer(boxes, "Exif", &payload)) {
+          return 1;
+        }
+        if (!WriteFile(args.extract_exif, payload)) return 1;
+      }
+      if (args.extract_xmp) {
+        if (!jxltran::ExtractMetadataPayloadToBuffer(boxes, "xml ", &payload)) {
+          return 1;
+        }
+        if (!WriteFile(args.extract_xmp, payload)) return 1;
+      }
+      if (args.extract_jumbf) {
+        if (!jxltran::ExtractMetadataPayloadToBuffer(boxes, "jumb", &payload)) {
+          return 1;
+        }
+        if (!WriteFile(args.extract_jumbf, payload)) return 1;
+      }
+    }
     return 0;
   }
 
@@ -979,11 +1417,31 @@ int main(int argc, const char* argv[]) {
     jxltran::ReorderBoxes(&boxes, args.box_order.order, args.box_order.types);
   }
 
+  if (is_container) {
+    if (args.set_exif) {
+      std::vector<uint8_t> payload;
+      if (!ReadFile(args.set_exif, &payload)) return 1;
+      jxltran::ReplaceMetadataBox(&boxes, "Exif", std::move(payload));
+    }
+    if (args.set_xmp) {
+      std::vector<uint8_t> payload;
+      if (!ReadFile(args.set_xmp, &payload)) return 1;
+      jxltran::ReplaceMetadataBox(&boxes, "xml ", std::move(payload));
+    }
+    if (args.set_jumbf) {
+      std::vector<uint8_t> payload;
+      if (!ReadFile(args.set_jumbf, &payload)) return 1;
+      jxltran::ReplaceMetadataBox(&boxes, "jumb", std::move(payload));
+    }
+  }
+
   // ── Codestream transforms (read → mutate ParsedCodestream → write)
   // ───────────
   const bool needs_codestream_transform =
       args.NeedsHeaderMod() || args.crop.set || args.GabOptionCount() > 0 ||
-      args.NeedsPhotonNoiseIso();
+      args.NeedsPhotonNoiseIso() || args.NeedsSplinesSet() ||
+      args.group_order != jxltran::TocGroupOrderCli::kKeep ||
+      args.NeedsOpsinAdjust();
   if (needs_codestream_transform) {
     auto transform_codestream = [&](std::vector<uint8_t>* cs) -> bool {
       const uint8_t* orig_bytes = cs->data();
@@ -1023,6 +1481,20 @@ int main(int argc, const char* argv[]) {
         if (!jxltran::ApplyHeaderMod(&parsed, mod)) return false;
       }
       bool wrote_anything = args.NeedsHeaderMod();
+      if (args.NeedsOpsinAdjust()) {
+        jxltran::OpsinAdjustParams oa;
+        if (args.opsin_exposure.set) oa.exposure_ev = args.opsin_exposure.value;
+        if (args.opsin_temperature.set) {
+          oa.temperature = args.opsin_temperature.value;
+        }
+        if (args.opsin_tint.set) oa.tint = args.opsin_tint.value;
+        if (args.opsin_hue.set) oa.hue = args.opsin_hue.value;
+        bool opsin_changed = false;
+        if (!jxltran::ApplyOpsinAdjust(&parsed, oa, &opsin_changed)) {
+          return false;
+        }
+        if (opsin_changed) wrote_anything = true;
+      }
       if (args.crop.set) {
         int32_t crop_x = args.crop.x;
         int32_t crop_y = args.crop.y;
@@ -1046,12 +1518,31 @@ int main(int argc, const char* argv[]) {
           wrote_anything = true;
         }
       }
+      const std::vector<size_t>* frame_sel =
+          args.frames.set ? &args.frames.indices : nullptr;
       if (args.GabOptionCount() > 0) {
-        if (!jxltran::ApplyGabArgs(&parsed, gab_args)) return false;
+        if (!jxltran::ApplyGabArgs(&parsed, gab_args, frame_sel)) return false;
+        wrote_anything = true;
+      }
+      if (args.group_order != jxltran::TocGroupOrderCli::kKeep) {
+        bool toc_changed = false;
+        if (!jxltran::ApplyTocGroupOrder(&parsed, args.group_order, args.center_x,
+                                        args.center_y, frame_sel,
+                                        &toc_changed)) {
+          return false;
+        }
+        if (toc_changed) wrote_anything = true;
+      }
+      if (args.NeedsSplinesSet()) {
+        if (!jxltran::ApplySplinesFromFile(&parsed, args.set_splines_from,
+                                           frame_sel)) {
+          return false;
+        }
         wrote_anything = true;
       }
       if (args.NeedsPhotonNoiseIso()) {
-        if (!jxltran::ApplyPhotonNoiseIso(&parsed, true, args.photon_iso.iso)) {
+        if (!jxltran::ApplyPhotonNoiseIso(&parsed, true, args.photon_iso.iso,
+                                          frame_sel)) {
           return false;
         }
         wrote_anything = true;
@@ -1112,6 +1603,13 @@ int main(int argc, const char* argv[]) {
     case ContainerOpt::kIfNeeded:
       output_container = is_container && jxltran::HasMetadataBoxes(boxes);
       break;
+  }
+
+  if (meta_set && !output_container) {
+    fprintf(stderr,
+            "jxltran: --set-exif/--set-xmp/--set-jumbf require container output "
+            "(--container cannot be no).\n");
+    return 1;
   }
 
   // ── Produce output ────────────────────────────────────────────────────────
