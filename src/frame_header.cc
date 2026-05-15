@@ -199,8 +199,8 @@ static void WritePasses(BitWriter& bw, const FramePasses& p) {
 
 // Lib's BlendingInfo serializes `source` when mode != kReplace OR the frame
 // is partial relative to the canvas (see FrameHeader::VisitFields).
-static bool ComputeIsPartialFrame(const FrameHeader& fh, uint32_t canvas_w,
-                                  uint32_t canvas_h) {
+bool FrameNeedsBlendingSourceField(const FrameHeader& fh, uint32_t canvas_w,
+                                   uint32_t canvas_h) {
   const bool normal = (fh.frame_type == kFrameTypeRegular ||
                        fh.frame_type == kFrameTypeSkipProgressive);
   if (!fh.have_crop || !normal) return false;
@@ -552,7 +552,7 @@ bool ReadFrameHeader(BitReader& br, const ImageMetadata& meta,
   };
 
   if (normal_frame) {
-    const bool is_partial = ComputeIsPartialFrame(*fh, canvas_w, canvas_h);
+    const bool is_partial = FrameNeedsBlendingSourceField(*fh, canvas_w, canvas_h);
     {
       const size_t p = br.pos();
       ReadBlendingInfo(br, meta.num_extra, is_partial, &fh->blending_info);
@@ -703,7 +703,7 @@ bool WriteFrameHeaderFromHaveCrop(BitWriter& bw, const FrameHeader& fh,
   }
 
   if (normal_frame) {
-    const bool is_partial = ComputeIsPartialFrame(fh, canvas_w, canvas_h);
+    const bool is_partial = FrameNeedsBlendingSourceField(fh, canvas_w, canvas_h);
     {
       const size_t p = bw.bit_pos();
       WriteBlendingInfo(bw, fh.blending_info, meta.num_extra, is_partial);

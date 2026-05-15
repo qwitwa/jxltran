@@ -406,7 +406,10 @@ static bool BuildPhotonStreamOrderBody(const FramedUnit& fu, const uint8_t* orig
 }  // namespace
 
 bool ReadCodestream(const uint8_t* data, size_t size, ParsedCodestream* out) {
-  out->frames.clear();
+  // Reset the full struct so a reused |out| cannot retain stale image metadata
+  // (e.g. have_animation) across reads — matches libjxl's decoder behaviour when
+  // optional bundles are absent (see ImageMetadata::VisitFields else branch).
+  *out = ParsedCodestream{};
   BitReader br(data, size);
   TraceSetReadBase(0);
   if (TraceIsOn()) {

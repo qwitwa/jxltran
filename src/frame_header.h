@@ -201,6 +201,11 @@ void ComputeFrameTocMetrics(const FrameHeader& fh, const ImageMetadata& meta,
                             uint32_t canvas_w, uint32_t canvas_h,
                             FrameTocMetrics* out);
 
+// True when blending_info serialization includes the `source` field (partial
+// frame or non-replace mode), matching ReadBlendingInfo / WriteBlendingInfo.
+bool FrameNeedsBlendingSourceField(const FrameHeader& fh, uint32_t canvas_w,
+                                   uint32_t canvas_h);
+
 // Parses the TOC that follows the frame header (toc.cc).
 // |br| must have consumed the frame header from the start of the frame span.
 // |frame_base|/|frame_len| are reserved for future bounds checks. On success,

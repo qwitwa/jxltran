@@ -501,6 +501,14 @@ static void WriteOpsinInverseMatrix(BitWriter& bw,
 
 static bool ReadImageMetadata(BitReader& br, ImageHeader* hdr) {
   ImageMetadata* m = &hdr->metadata;
+  // Clear ICC bookkeeping and metadata defaults before parsing so skipped
+  // branches (all_default, or extra_fields == false) never inherit values from
+  // a previous parse on the same ImageHeader (libjxl explicitly resets fields
+  // in the extra_fields == false case).
+  hdr->icc_start_bit = 0;
+  hdr->icc_end_bit = 0;
+  hdr->icc_bytes.clear();
+  *m = ImageMetadata{};
   {
     const size_t p = br.pos();
     m->all_default = br.ReadBool();
@@ -528,7 +536,15 @@ static bool ReadImageMetadata(BitReader& br, ImageHeader* hdr) {
       m->have_animation = br.ReadBool();
       if (m->have_animation) {
         if (!ReadAnimationHeader(br, &m->animation)) return false;
+      } else {
+        m->animation = AnimationHeader{};
       }
+    } else {
+      m->orientation = 1;
+      m->have_intr_size = false;
+      m->have_preview = false;
+      m->have_animation = false;
+      m->animation = AnimationHeader{};
     }
     if (!ReadBitDepth(br, &m->bit_depth)) return false;
     m->modular_16bit_buffers = br.ReadBool();

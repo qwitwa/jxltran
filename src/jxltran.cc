@@ -19,11 +19,13 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "box.h"
 #include "cmdline.h"
 #include "codestream.h"
+#include "frame_header.h"
 #include "image_header.h"
 #include "operations.h"
 #include "opsin_adjust.h"
@@ -613,6 +615,63 @@ struct PhotonIsoArg {
   float iso = 0.f;
 };
 
+struct EpfItersArg {
+  bool set = false;
+  uint32_t iters = 0;
+};
+
+static bool ParseEpfItersOpt(const char* s, EpfItersArg* out) {
+  char* end = nullptr;
+  const unsigned long v = strtoul(s, &end, 10);
+  if (end == s || *end != '\0' || v > 3ul) {
+    fprintf(stderr,
+            "jxltran: --set-epf-iters expects 0, 1, 2, or 3, got '%s'\n", s);
+    return false;
+  }
+  out->set = true;
+  out->iters = static_cast<uint32_t>(v);
+  return true;
+}
+
+struct EpfAmpScaleArg {
+  bool set = false;
+  float factor = 1.f;
+};
+
+static bool ParseEpfAmpScaleOpt(const char* s, EpfAmpScaleArg* out) {
+  char* end = nullptr;
+  const float v = strtof(s, &end);
+  if (end == s || *end != '\0' || !(v > 0.f) || !std::isfinite(v)) {
+    fprintf(stderr,
+            "jxltran: --set-epf-amplitude-scale expects a positive finite float, "
+            "got '%s'\n",
+            s);
+    return false;
+  }
+  out->set = true;
+  out->factor = v;
+  return true;
+}
+
+struct EpfUniformArg {
+  bool set = false;
+  float value = 0.f;
+};
+
+static bool ParseEpfUniformOpt(const char* s, EpfUniformArg* out) {
+  char* end = nullptr;
+  const float v = strtof(s, &end);
+  if (end == s || *end != '\0' || !std::isfinite(v) || v < 0.f || v > 1.f) {
+    fprintf(stderr,
+            "jxltran: --set-epf-uniformity expects a float in [0,1], got '%s'\n",
+            s);
+    return false;
+  }
+  out->set = true;
+  out->value = v;
+  return true;
+}
+
 static bool ParsePhotonIsoOpt(const char* s, PhotonIsoArg* out) {
   char* end = nullptr;
   const float v = strtof(s, &end);
@@ -630,12 +689,17 @@ static bool ParsePhotonIsoOpt(const char* s, PhotonIsoArg* out) {
 
 struct FramesArg {
   bool set = false;
+  /** Sorted unique indices; used with --frames for per-frame filters. */
   std::vector<size_t> indices;
+  /** First-mention order without duplicates; legacy use with --keep-listed-frames
+   * when --keep-frames is omitted. */
+  std::vector<size_t> indices_ordered;
 };
 
 static bool ParseFramesArg(const char* s, FramesArg* out) {
   out->set = true;
   out->indices.clear();
+  out->indices_ordered.clear();
   if (s == nullptr || s[0] == '\0') {
     fprintf(stderr,
             "jxltran: --frames expects a comma-separated list of non-negative "
@@ -658,7 +722,15 @@ static bool ParseFramesArg(const char* s, FramesArg* out) {
               p);
       return false;
     }
-    out->indices.push_back(static_cast<size_t>(v));
+    const size_t idx = static_cast<size_t>(v);
+    bool seen = false;
+    for (size_t x : out->indices_ordered) {
+      if (x == idx) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) out->indices_ordered.push_back(idx);
     p = end;
     while (*p == ' ' || *p == '\t') ++p;
     if (*p == ',') {
@@ -670,13 +742,637 @@ static bool ParseFramesArg(const char* s, FramesArg* out) {
             "jxltran: --frames: expected end of list or ',' before '%s'\n", p);
     return false;
   }
-  if (out->indices.empty()) {
+  if (out->indices_ordered.empty()) {
     fprintf(stderr, "jxltran: --frames needs at least one frame index\n");
     return false;
   }
+  out->indices = out->indices_ordered;
   std::sort(out->indices.begin(), out->indices.end());
-  out->indices.erase(std::unique(out->indices.begin(), out->indices.end()),
-                     out->indices.end());
+  return true;
+}
+
+struct KeepFramesArg {
+  bool set = false;
+  std::vector<size_t> indices;
+  std::vector<size_t> indices_ordered;
+};
+
+static bool ParseKeepFramesArg(const char* s, KeepFramesArg* out) {
+  out->set = true;
+  out->indices.clear();
+  out->indices_ordered.clear();
+  if (s == nullptr || s[0] == '\0') {
+    fprintf(stderr,
+            "jxltran: --keep-frames expects a comma-separated list of non-negative "
+            "integers (codestream frame indices, 0-based)\n");
+    return false;
+  }
+  const char* p = s;
+  while (*p != '\0') {
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') break;
+    char* end = nullptr;
+    unsigned long v = strtoul(p, &end, 10);
+    if (end == p) {
+      fprintf(stderr, "jxltran: --keep-frames: invalid integer near '%s'\n", p);
+      return false;
+    }
+    if (v > static_cast<unsigned long>(
+            (std::numeric_limits<size_t>::max)())) {
+      fprintf(stderr,
+              "jxltran: --keep-frames: frame index out of range near '%s'\n", p);
+      return false;
+    }
+    const size_t idx = static_cast<size_t>(v);
+    bool seen = false;
+    for (size_t x : out->indices_ordered) {
+      if (x == idx) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) out->indices_ordered.push_back(idx);
+    p = end;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == ',') {
+      ++p;
+      continue;
+    }
+    if (*p == '\0') break;
+    fprintf(stderr,
+            "jxltran: --keep-frames: expected end of list or ',' before '%s'\n", p);
+    return false;
+  }
+  if (out->indices_ordered.empty()) {
+    fprintf(stderr, "jxltran: --keep-frames needs at least one frame index\n");
+    return false;
+  }
+  out->indices = out->indices_ordered;
+  std::sort(out->indices.begin(), out->indices.end());
+  return true;
+}
+
+struct SetFrameBlendsArg {
+  bool set = false;
+  std::vector<jxltran::FrameBlendOverride> overrides;
+};
+
+struct SetFrameDurationsArg {
+  bool set = false;
+  std::vector<std::pair<size_t, uint32_t>> pairs;
+};
+
+struct SetFrameNamesArg {
+  bool set = false;
+  std::vector<std::pair<size_t, std::vector<uint8_t>>> pairs;
+};
+
+struct SetFrameRegionsArg {
+  bool set = false;
+  std::vector<std::pair<size_t, CropArg>> pairs;
+};
+
+static int HexNibbleForFrameName(const char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+static bool ParseSetFrameNamesArg(const char* s, SetFrameNamesArg* out) {
+  out->set = true;
+  out->pairs.clear();
+  if (s == nullptr || s[0] == '\0') {
+    fprintf(stderr,
+            "jxltran: --set-frame-names expects INDEX:HEX pairs "
+            "(comma-separated); HEX is an even-length hex string (UTF-8 "
+            "bytes, same as --info name_hex=); omit HEX to clear the name\n");
+    return false;
+  }
+  const char* p = s;
+  while (*p != '\0') {
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') break;
+    char* end = nullptr;
+    unsigned long fi = strtoul(p, &end, 10);
+    if (end == p) {
+      fprintf(stderr,
+              "jxltran: --set-frame-names: expected frame index near '%s'\n",
+              p);
+      return false;
+    }
+    if (fi > static_cast<unsigned long>(
+            (std::numeric_limits<size_t>::max)())) {
+      fprintf(stderr,
+              "jxltran: --set-frame-names: frame index out of range near '%s'\n",
+              p);
+      return false;
+    }
+    p = end;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p != ':') {
+      fprintf(stderr,
+              "jxltran: --set-frame-names: expected ':' after frame index near "
+              "'%s'\n",
+              p);
+      return false;
+    }
+    ++p;
+    while (*p == ' ' || *p == '\t') ++p;
+    const char* hex_start = p;
+    while (std::isxdigit(static_cast<unsigned char>(*p))) ++p;
+    const size_t hex_len = static_cast<size_t>(p - hex_start);
+    if (hex_len % 2 != 0) {
+      fprintf(stderr,
+              "jxltran: --set-frame-names: hex length must be even (UTF-8 "
+              "bytes), got %" PRIuS " hex digits for frame %lu\n",
+              hex_len, static_cast<unsigned long>(fi));
+      return false;
+    }
+    std::vector<uint8_t> name;
+    name.reserve(hex_len / 2);
+    for (size_t i = 0; i < hex_len; i += 2) {
+      const int hi = HexNibbleForFrameName(hex_start[i]);
+      const int lo = HexNibbleForFrameName(hex_start[i + 1]);
+      if (hi < 0 || lo < 0) {
+        fprintf(stderr,
+                "jxltran: --set-frame-names: invalid hex near '%s'\n",
+                hex_start);
+        return false;
+      }
+      name.push_back(static_cast<uint8_t>((hi << 4) | lo));
+    }
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p != '\0' && *p != ',') {
+      fprintf(stderr,
+              "jxltran: --set-frame-names: unexpected character after hex near "
+              "'%s'\n",
+              p);
+      return false;
+    }
+    out->pairs.emplace_back(static_cast<size_t>(fi), std::move(name));
+    if (*p == ',') {
+      ++p;
+      continue;
+    }
+    if (*p == '\0') break;
+  }
+  if (out->pairs.empty()) {
+    fprintf(stderr, "jxltran: --set-frame-names needs at least one pair\n");
+    return false;
+  }
+  return true;
+}
+
+static bool ParseBlendModeToken(const char* token, uint32_t* mode_out) {
+  char* end = nullptr;
+  unsigned long v = strtoul(token, &end, 10);
+  if (end != token && *end == '\0') {
+    if (v <= 4u) {
+      *mode_out = static_cast<uint32_t>(v);
+      return true;
+    }
+    fprintf(stderr,
+            "jxltran: blend mode must be 0–4 or a slug (replace, add, …), got "
+            "'%s'\n",
+            token);
+    return false;
+  }
+  if (strcmp(token, "replace") == 0) {
+    *mode_out = 0;
+    return true;
+  }
+  if (strcmp(token, "add") == 0) {
+    *mode_out = 1;
+    return true;
+  }
+  if (strcmp(token, "blend") == 0) {
+    *mode_out = 2;
+    return true;
+  }
+  if (strcmp(token, "alpha_weighted_add") == 0) {
+    *mode_out = 3;
+    return true;
+  }
+  if (strcmp(token, "mul") == 0) {
+    *mode_out = 4;
+    return true;
+  }
+  fprintf(stderr,
+          "jxltran: unknown blend mode '%s' (use 0–4 or replace|add|blend|"
+          "alpha_weighted_add|mul)\n",
+          token);
+  return false;
+}
+
+static bool LooksLikeFrameIndexColon(const char* p) {
+  while (*p == ' ' || *p == '\t') ++p;
+  if (*p == '\0') return false;
+  if (!std::isdigit(static_cast<unsigned char>(*p))) return false;
+  char* end = nullptr;
+  (void)strtoul(p, &end, 10);
+  return end != nullptr && end > p && *end == ':';
+}
+
+static bool ParseBlendBoolVal(const std::string& val, bool* out) {
+  if (val == "0" || val == "false" || val == "no") {
+    *out = false;
+    return true;
+  }
+  if (val == "1" || val == "true" || val == "yes") {
+    *out = true;
+    return true;
+  }
+  return false;
+}
+
+static bool ApplyBlendOverrideKeyVal(jxltran::FrameBlendOverride* o,
+                                     const std::string& key,
+                                     const std::string& val) {
+  if (key == "alpha") {
+    char* e = nullptr;
+    unsigned long v = strtoul(val.c_str(), &e, 10);
+    if (e != val.c_str() + val.size()) {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends: alpha= expects a non-negative "
+              "integer, got '%s'\n",
+              val.c_str());
+      return false;
+    }
+    if (v > static_cast<unsigned long>(UINT32_MAX)) return false;
+    o->set_alpha_channel = true;
+    o->alpha_channel = static_cast<uint32_t>(v);
+    return true;
+  }
+  if (key == "clamp") {
+    bool b = false;
+    if (!ParseBlendBoolVal(val, &b)) {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends: clamp= expects 0|1|true|false|"
+              "yes|no, got '%s'\n",
+              val.c_str());
+      return false;
+    }
+    o->set_clamp = true;
+    o->clamp = b;
+    return true;
+  }
+  if (key == "source") {
+    char* e = nullptr;
+    unsigned long v = strtoul(val.c_str(), &e, 10);
+    if (e != val.c_str() + val.size()) {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends: source= expects an integer, got '%s'\n",
+              val.c_str());
+      return false;
+    }
+    if (v > static_cast<unsigned long>(UINT32_MAX)) return false;
+    o->set_source = true;
+    o->source = static_cast<uint32_t>(v);
+    return true;
+  }
+  if (key == "target" || key == "save_as_reference") {
+    char* e = nullptr;
+    unsigned long v = strtoul(val.c_str(), &e, 10);
+    if (e != val.c_str() + val.size()) {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends: target= expects an integer 0–3, "
+              "got '%s'\n",
+              val.c_str());
+      return false;
+    }
+    if (v > 3u) {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends: target= must be in range 0–3\n");
+      return false;
+    }
+    o->set_save_as_reference = true;
+    o->save_as_reference = static_cast<uint32_t>(v);
+    return true;
+  }
+  fprintf(stderr,
+          "jxltran: --set-frame-blends: unknown field '%s' (use alpha=, "
+          "clamp=, source=, target=)\n",
+          key.c_str());
+  return false;
+}
+
+static bool ParseSetFrameBlendsArg(const char* s, SetFrameBlendsArg* out) {
+  out->set = true;
+  out->overrides.clear();
+  if (s == nullptr || s[0] == '\0') {
+    fprintf(stderr,
+            "jxltran: --set-frame-blends expects INDEX:MODE[,FIELD=VAL...] "
+            "entries\n"
+            "    (comma-separated frames; optional alpha=, clamp=, source=, "
+            "target= per frame)\n");
+    return false;
+  }
+  const char* p = s;
+  while (*p != '\0') {
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') break;
+
+    jxltran::FrameBlendOverride o{};
+    char* end = nullptr;
+    unsigned long fi = strtoul(p, &end, 10);
+    if (end == p) {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends: expected frame index near '%s'\n", p);
+      return false;
+    }
+    if (fi > static_cast<unsigned long>(
+            (std::numeric_limits<size_t>::max)())) {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends: frame index out of range near '%s'\n",
+              p);
+      return false;
+    }
+    p = end;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p != ':') {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends: expected ':' after frame index near "
+              "'%s'\n",
+              p);
+      return false;
+    }
+    ++p;
+    while (*p == ' ' || *p == '\t') ++p;
+    const char* mode_start = p;
+    while (*p != '\0') {
+      if (*p == ',') {
+        if (LooksLikeFrameIndexColon(p + 1)) break;
+        break;
+      }
+      if (*p == ' ' || *p == '\t') break;
+      ++p;
+    }
+    if (p == mode_start) {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends: missing blend mode after ':'\n");
+      return false;
+    }
+    std::string mode_token(mode_start, p);
+    if (!ParseBlendModeToken(mode_token.c_str(), &o.mode)) return false;
+    o.frame_index = static_cast<size_t>(fi);
+
+    bool done_frame = false;
+    while (!done_frame) {
+      while (*p == ' ' || *p == '\t') ++p;
+      if (*p == '\0') {
+        out->overrides.push_back(o);
+        done_frame = true;
+        break;
+      }
+      if (*p == ',') {
+        if (LooksLikeFrameIndexColon(p + 1)) {
+          ++p;
+          out->overrides.push_back(o);
+          done_frame = true;
+          break;
+        }
+        ++p;
+        continue;
+      }
+      if (LooksLikeFrameIndexColon(p)) {
+        out->overrides.push_back(o);
+        done_frame = true;
+        break;
+      }
+
+      const char* key_start = p;
+      while (*p != '\0' && *p != '=' && *p != ',' && *p != ' ' && *p != '\t') {
+        ++p;
+      }
+      if (*p != '=') {
+        fprintf(stderr,
+                "jxltran: --set-frame-blends: expected key=value near '%s'\n",
+                key_start);
+        return false;
+      }
+      std::string key(key_start, p);
+      ++p;
+      const char* val_start = p;
+      while (*p != '\0' && *p != ',' && *p != ' ' && *p != '\t') ++p;
+      if (p == val_start) {
+        fprintf(stderr,
+                "jxltran: --set-frame-blends: empty value for key '%s'\n",
+                key.c_str());
+        return false;
+      }
+      std::string val(val_start, p);
+      if (!ApplyBlendOverrideKeyVal(&o, key, val)) return false;
+    }
+  }
+  if (out->overrides.empty()) {
+    fprintf(stderr, "jxltran: --set-frame-blends needs at least one entry\n");
+    return false;
+  }
+  return true;
+}
+
+static bool ParseSetFrameDurationsArg(const char* s, SetFrameDurationsArg* out) {
+  out->set = true;
+  out->pairs.clear();
+  if (s == nullptr || s[0] == '\0') {
+    fprintf(stderr,
+            "jxltran: --set-frame-durations expects INDEX:TICKS pairs "
+            "(comma-separated)\n");
+    return false;
+  }
+  const char* p = s;
+  while (*p != '\0') {
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') break;
+    char* end = nullptr;
+    unsigned long fi = strtoul(p, &end, 10);
+    if (end == p) {
+      fprintf(stderr,
+              "jxltran: --set-frame-durations: expected frame index near '%s'\n",
+              p);
+      return false;
+    }
+    if (fi > static_cast<unsigned long>(
+            (std::numeric_limits<size_t>::max)())) {
+      fprintf(stderr,
+              "jxltran: --set-frame-durations: frame index out of range near "
+              "'%s'\n",
+              p);
+      return false;
+    }
+    p = end;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p != ':') {
+      fprintf(stderr,
+              "jxltran: --set-frame-durations: expected ':' after frame index "
+              "near '%s'\n",
+              p);
+      return false;
+    }
+    ++p;
+    while (*p == ' ' || *p == '\t') ++p;
+    unsigned long ticks = strtoul(p, &end, 10);
+    if (end == p) {
+      fprintf(stderr,
+              "jxltran: --set-frame-durations: missing tick count after ':'\n");
+      return false;
+    }
+    if (ticks > static_cast<unsigned long>(UINT32_MAX)) {
+      fprintf(stderr,
+              "jxltran: --set-frame-durations: duration out of uint32 range\n");
+      return false;
+    }
+    if (*end != '\0' && *end != ',' && *end != ' ' && *end != '\t') {
+      fprintf(stderr,
+              "jxltran: --set-frame-durations: invalid duration near '%s'\n",
+              end);
+      return false;
+    }
+    out->pairs.emplace_back(static_cast<size_t>(fi), static_cast<uint32_t>(ticks));
+    p = end;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == ',') {
+      ++p;
+      continue;
+    }
+    if (*p == '\0') break;
+    fprintf(stderr,
+            "jxltran: --set-frame-durations: expected end or ',' before '%s'\n",
+            p);
+    return false;
+  }
+  if (out->pairs.empty()) {
+    fprintf(stderr, "jxltran: --set-frame-durations needs at least one pair\n");
+    return false;
+  }
+  return true;
+}
+
+static bool ParseSetFrameRegionsArg(const char* s, SetFrameRegionsArg* out) {
+  out->set = true;
+  out->pairs.clear();
+  if (s == nullptr || s[0] == '\0') {
+    fprintf(stderr,
+            "jxltran: --set-frame-region expects INDEX:WxH+X+Y (comma-separated "
+            "entries allowed)\n");
+    return false;
+  }
+  const char* p = s;
+  while (*p != '\0') {
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') break;
+    char* end = nullptr;
+    unsigned long fi = strtoul(p, &end, 10);
+    if (end == p) {
+      fprintf(stderr,
+              "jxltran: --set-frame-region: expected frame index near '%s'\n",
+              p);
+      return false;
+    }
+    if (fi > static_cast<unsigned long>(
+            (std::numeric_limits<size_t>::max)())) {
+      fprintf(stderr,
+              "jxltran: --set-frame-region: frame index out of range near '%s'\n",
+              p);
+      return false;
+    }
+    p = end;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p != ':') {
+      fprintf(stderr,
+              "jxltran: --set-frame-region: expected ':' after frame index near "
+              "'%s'\n",
+              p);
+      return false;
+    }
+    ++p;
+    const char* crop_start = p;
+    while (*p != '\0') {
+      if (*p == ',' && LooksLikeFrameIndexColon(p + 1)) {
+        break;
+      }
+      ++p;
+    }
+    while (p > crop_start && (p[-1] == ' ' || p[-1] == '\t')) {
+      --p;
+    }
+    std::string crop_str(crop_start, p);
+    if (crop_str.empty()) {
+      fprintf(stderr,
+              "jxltran: --set-frame-region: missing WxH+X+Y after frame index\n");
+      return false;
+    }
+    unsigned wu = 0, hu = 0;
+    int consumed = 0;
+    if (std::sscanf(crop_str.c_str(), "%ux%u%n", &wu, &hu, &consumed) != 2 ||
+        wu == 0 || hu == 0) {
+      fprintf(stderr,
+              "jxltran: --set-frame-region: expected WxH or WxH with two signed "
+              "offsets (e.g. 3000x2000+5-3), got '%s'\n",
+              crop_str.c_str());
+      return false;
+    }
+    const char* tail = crop_str.c_str() + consumed;
+    int32_t x = 0;
+    int32_t y = 0;
+    if (*tail != '\0') {
+      char* endx = nullptr;
+      long xl = std::strtol(tail, &endx, 10);
+      if (endx == tail) {
+        fprintf(stderr,
+                "jxltran: --set-frame-region: invalid X offset in '%s'\n",
+                crop_str.c_str());
+        return false;
+      }
+      char* endy = nullptr;
+      long yl = std::strtol(endx, &endy, 10);
+      if (endy == endx) {
+        fprintf(stderr,
+                "jxltran: --set-frame-region: expected two signed offsets after "
+                "WxH in '%s'\n",
+                crop_str.c_str());
+        return false;
+      }
+      if (*endy != '\0') {
+        fprintf(stderr,
+                "jxltran: --set-frame-region: trailing garbage after offsets in "
+                "'%s'\n",
+                crop_str.c_str());
+        return false;
+      }
+      if (xl < INT32_MIN || xl > INT32_MAX || yl < INT32_MIN ||
+          yl > INT32_MAX) {
+        fprintf(stderr,
+                "jxltran: --set-frame-region: offsets out of range in '%s'\n",
+                crop_str.c_str());
+        return false;
+      }
+      x = static_cast<int32_t>(xl);
+      y = static_cast<int32_t>(yl);
+    }
+    CropArg cr;
+    cr.set = true;
+    cr.w = wu;
+    cr.h = hu;
+    cr.x = x;
+    cr.y = y;
+    out->pairs.emplace_back(static_cast<size_t>(fi), cr);
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') break;
+    if (*p == ',') {
+      ++p;
+      continue;
+    }
+    fprintf(stderr,
+            "jxltran: --set-frame-region: expected end or ',' before '%s'\n",
+            p);
+    return false;
+  }
+  if (out->pairs.empty()) {
+    fprintf(stderr, "jxltran: --set-frame-region needs at least one entry\n");
+    return false;
+  }
   return true;
 }
 
@@ -737,10 +1433,19 @@ struct Args {
   OpsinFloatOpt opsin_hue;
   CropArg crop;
   FramesArg frames;
+  KeepFramesArg keep_frames;
+  bool keep_listed_frames = false;
+  SetFrameBlendsArg set_frame_blends;
+  SetFrameDurationsArg set_frame_durations;
+  SetFrameNamesArg set_frame_names;
+  SetFrameRegionsArg set_frame_regions;
   jxltran::TocGroupOrderCli group_order = jxltran::TocGroupOrderCli::kKeep;
   int64_t center_x = -1;
   int64_t center_y = -1;
   PhotonIsoArg photon_iso;
+  EpfItersArg epf_iters;
+  EpfAmpScaleArg epf_amp_scale;
+  EpfUniformArg epf_uniform;
   const char* gab_blur = nullptr;
   const char* gab_sharpen = nullptr;
   const char* gab_weights = nullptr;
@@ -754,6 +1459,9 @@ struct Args {
   const char* set_xmp = nullptr;
   const char* set_jumbf = nullptr;
   bool verbose = false;
+  const char* append_jxl = nullptr;
+  bool append_jxl_skip_compat_check = false;
+  bool append_dummy_tail = false;
 
   int GabOptionCount() const {
     return (gab_blur != nullptr) + (gab_sharpen != nullptr) +
@@ -772,16 +1480,78 @@ struct Args {
 
   bool NeedsPhotonNoiseIso() const { return photon_iso.set; }
 
+  bool NeedsEpfIters() const { return epf_iters.set; }
+
+  bool NeedsEpfAmpScale() const { return epf_amp_scale.set; }
+
+  bool NeedsEpfUniformity() const { return epf_uniform.set; }
+
   bool NeedsSplinesSet() const { return set_splines_from != nullptr; }
+
+  bool NeedsKeepListedFrames() const { return keep_listed_frames; }
+
+  bool NeedsSetFrameBlends() const { return set_frame_blends.set; }
+
+  bool NeedsSetFrameDurations() const { return set_frame_durations.set; }
+
+  bool NeedsSetFrameNames() const { return set_frame_names.set; }
+
+  bool NeedsSetFrameRegions() const { return set_frame_regions.set; }
 
   void AddCommandLineOptions(jpegxl::tools::CommandLineParser* cmdline) {
     cmdline->AddPositionalOption("INPUT", /*required=*/true,
                                  "The JPEG XL input file.", &file_in);
     cmdline->AddPositionalOption(
         "OUTPUT", /*required=*/false,
-        "The JPEG XL output file (omit with --info or --extract-icc).",
+        "The JPEG XL output file (omit with --info, --extract-*, and other "
+        "read-only modes).",
         &file_out);
-    cmdline->AddHelpText("\nOutput options:", 0);
+    cmdline->AddHelpText("\nInspect and extract (no OUTPUT file):", 0);
+    cmdline->AddOptionFlag(
+        '\0', "info",
+        "Print oriented display dimensions, animation flag, and one "
+        "frame_region line per frame (WxH+X+Y in display space, same "
+        "orientation as dimensions), then exit. No OUTPUT file; cannot be "
+        "combined with transform or remux options.",
+        &info, &jpegxl::tools::SetBooleanTrue);
+    cmdline->AddOptionValue(
+        '\0', "extract-icc", "FILE",
+        "Write the codestream-embedded ICC profile to FILE (when present) and "
+        "exit. No OUTPUT file; same combination rules as --info (only "
+        "optional -v/--verbose).",
+        &extract_icc, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "extract-exif", "FILE",
+        "Write the first Exif box payload to FILE (raw TIFF Exif block) and "
+        "exit.\n"
+        "brob-wrapped Exif is decompressed when jxltran is built with brotli. "
+        "No\n"
+        "OUTPUT file; same combination rules as --extract-icc.",
+        &extract_exif, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "extract-xmp", "FILE",
+        "Write the first XMP metadata box (type xml ) payload to FILE and "
+        "exit.\n"
+        "brob-wrapped XMP is decompressed when built with brotli. No OUTPUT; "
+        "same\n"
+        "rules as --extract-icc.",
+        &extract_xmp, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "extract-jumbf", "FILE",
+        "Write the first JUMBF box (type jumb) payload to FILE and exit.\n"
+        "brob-wrapped JUMBF is decompressed when built with brotli. No OUTPUT; "
+        "same\n"
+        "rules as --extract-icc.",
+        &extract_jumbf, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "extract-splines", "FILE",
+        "Write LF-global spline geometry and quantized coefficients as text "
+        "and exit.\n"
+        "Format matches --set-splines-from. Optional --frames selects codestream "
+        "frames.\n"
+        "No OUTPUT; same combination rules as --extract-icc.",
+        &extract_splines, StoreExtractIccPath);
+    cmdline->AddHelpText("\nContainer and metadata boxes:", 0);
     cmdline->AddOptionValue(
         '\0', "container", "keep|no|yes|if-needed",
         "Container output mode (default: keep).\n"
@@ -842,7 +1612,28 @@ struct Args {
         "\n    (brotli support not compiled in; only keep is effective)",
 #endif
         &brob, ParseBrobOpt);
-    cmdline->AddHelpText("\nImage header options:", 0);
+    cmdline->AddHelpText("\nReplace metadata from files:", 0);
+    cmdline->AddOptionValue(
+        '\0', "set-exif", "FILE",
+        "Replace (or add) the Exif metadata box with the contents of FILE. "
+        "Removes\n"
+        "any existing Exif and brob-wrapped Exif boxes. Bare codestream input is "
+        "wrapped\n"
+        "in a minimal container.",
+        &set_exif, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "set-xmp", "FILE",
+        "Replace (or add) the XMP box (xml ) with the contents of FILE; same "
+        "semantics\n"
+        "as --set-exif.",
+        &set_xmp, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "set-jumbf", "FILE",
+        "Replace (or add) the JUMBF box (jumb) with the contents of FILE; same "
+        "semantics\n"
+        "as --set-exif.",
+        &set_jumbf, StoreExtractIccPath);
+    cmdline->AddHelpText("\nImage header:", 0);
     cmdline->AddOptionValue('\0', "set-orientation", "1..8|90|180|270",
                             "Set the orientation field in the image header.\n"
                             "Orientation values (Exif semantics):\n"
@@ -910,7 +1701,7 @@ struct Args {
         "XYB only: small hue rotation in the linear R–B plane, −100..+100 "
         "(~±5° at extremes).",
         &opsin_hue, ParseOpsinHueOpt);
-    cmdline->AddHelpText("\nCrop options:", 0);
+    cmdline->AddHelpText("\nCrop:", 0);
     cmdline->AddOptionValue(
         '\0', "crop", "WxH or WxHXY",
         "Reversible metadata-only canvas resize / crop. WxH is the new canvas\n"
@@ -932,9 +1723,7 @@ struct Args {
         "compressed\n"
         "sample data is re-encoded.",
         &crop, ParseCropOpt);
-    cmdline->AddHelpText(
-        "\nFrame-level codestream edits (TOC order, Gaborish, photon noise):",
-        0);
+    cmdline->AddHelpText("\nFrames (selection, order, append):", 0);
     cmdline->AddOptionValue(
         '\0', "frames", "N[,N...]",
         "Apply the frame-level operations below only to the listed codestream "
@@ -943,8 +1732,120 @@ struct Args {
         "`frame_region:` line from --info). Omit --frames to affect every "
         "regular or\n"
         "skip-progressive frame (LF and reference-only frames are always left "
-        "unchanged).",
+        "unchanged).\n"
+        "With --keep-listed-frames and no --keep-frames, the same list selects "
+        "which\n"
+        "frames to retain (legacy); prefer --keep-frames for that case so "
+        "--frames can\n"
+        "still mean “filter only” independently.",
         &frames, ParseFramesArg);
+    cmdline->AddOptionValue(
+        '\0', "keep-frames", "N[,N...]",
+        "With --keep-listed-frames only: codestream frame indices to keep, in "
+        "output\n"
+        "order (reorder and/or subset; first occurrence wins; duplicate indices "
+        "are\n"
+        "deduplicated). Other frame-level operations still use --frames when "
+        "given.\n"
+        "When --keep-listed-frames is set and --keep-frames is omitted, "
+        "--frames supplies\n"
+        "the keep list (backward compatible).",
+        &keep_frames, ParseKeepFramesArg);
+    cmdline->AddOptionFlag(
+        '\0', "keep-listed-frames",
+        "Rewrite the codestream to contain only the frames listed in "
+        "--keep-frames\n"
+        "(or in --frames when --keep-frames is omitted), in the order given "
+        "(reorder\n"
+        "and/or subset; first occurrence of each index wins; duplicates are "
+        "deduplicated).\n"
+        "Verbatim compressed frame data is preserved; the last kept frame must "
+        "be regular or\n"
+        "skip-progressive.\n"
+        "Decoding the result can fail if a kept frame still depends on a "
+        "dropped reference\n"
+        "or blend source. Requires OUTPUT and (--keep-frames or --frames).",
+        &keep_listed_frames, &jpegxl::tools::SetBooleanTrue);
+    cmdline->AddOptionValue(
+        '\0', "append-jxl", "FILE",
+        "After reading INPUT, concatenate the codestream frames of FILE after "
+        "those of INPUT.\n"
+        "The output canvas is max(INPUT, FILE) in width and height; frames that "
+        "used implicit full-canvas\n"
+        "geometry on the smaller side get an explicit crop to that side's canvas "
+        "size at origin (0,0).\n"
+        "Compatibility is only: same number of extra channels; both XYB or both "
+        "non-XYB;\n"
+        "when non-XYB, the main bit depth must match. The last frame of INPUT\n"
+        "is rewritten with is_last=false; FILE's image header bytes are "
+        "skipped. Decoder output may still\n"
+        "fail if appended frames depend on reference state that does not match "
+        "the end of INPUT. Requires OUTPUT.",
+        &append_jxl, StoreExtractIccPath);
+    cmdline->AddOptionFlag(
+        '\0', "append-jxl-skip-compat-check",
+        "With --append-jxl only: skip the XYB / bit-depth / extra-channel "
+        "header compatibility check (may produce invalid output).",
+        &append_jxl_skip_compat_check, &jpegxl::tools::SetBooleanTrue);
+    cmdline->AddOptionFlag(
+        '\0', "append-dummy-tail",
+        "Append a fixed minimal 42×3 modular all-zero terminal frame after "
+        "INPUT's frames (skips header compatibility vs INPUT). After merge the "
+        "previous frame saves to reference slot 1 and the tail uses kAdd with "
+        "blending source 1 (zeros added to that slot). "
+        "Requires OUTPUT; do not use with --append-jxl.",
+        &append_dummy_tail, &jpegxl::tools::SetBooleanTrue);
+    cmdline->AddHelpText("\nFrame blend, timing, names, and layout:", 0);
+    cmdline->AddOptionValue(
+        '\0', "set-frame-blends", "SPEC[,SPEC...]",
+        "Per-frame blend overrides. Each SPEC is INDEX:MODE with optional "
+        ",FIELD=VAL\n"
+        "    tails: alpha=N, clamp=0|1|true|false, source=N, target=N "
+        "(comma-separated within one\n"
+        "    frame). target= sets save_as_reference (reference slot 0–3) and "
+        "is only allowed when\n"
+        "    the frame is not last in the codestream. Values are written as "
+        "given (decoder behavior may vary if "
+        "they do not\n"
+        "    match the bitstream rules for the chosen mode). MODE is 0–4 or "
+        "replace|add|blend|alpha_weighted_add|mul. Separate frames\n"
+        "    with a comma only when the next token looks like a new INDEX: "
+        "e.g.\n"
+        "    0:blend,alpha=0,clamp=1,1:add\n"
+        "    Optional fields apply only when serialized for that mode (see "
+        "ReadBlendingInfo).",
+        &set_frame_blends, ParseSetFrameBlendsArg);
+    cmdline->AddOptionValue(
+        '\0', "set-frame-durations", "INDEX:TICKS[,INDEX:TICKS...]",
+        "Set frame duration (animation ticks) on regular / skip-progressive "
+        "frames.\n"
+        "Requires have_animation in the codestream.",
+        &set_frame_durations, ParseSetFrameDurationsArg);
+    cmdline->AddOptionValue(
+        '\0', "set-frame-names", "INDEX:HEX[,INDEX:HEX...]",
+        "Set per-frame name bytes (UTF-8) on regular / skip-progressive "
+        "frames.\n"
+        "    HEX : even-length hex (same encoding as `name_hex=` from "
+        "--info). Use INDEX:\n"
+        "          with no hex digits to clear the name. Indices refer to "
+        "codestream order\n"
+        "          after other edits in this run (e.g. after "
+        "--keep-listed-frames).",
+        &set_frame_names, ParseSetFrameNamesArg);
+    cmdline->AddOptionValue(
+        '\0', "set-frame-region", "INDEX:WxH+X+Y[,INDEX:WxH+X+Y...]",
+        "Reposition a regular or skip-progressive frame's display rectangle "
+        "(WxH+X+Y in\n"
+        "    the same oriented display space as `jxltran --info` and --crop). "
+        "Width and height\n"
+        "    must match the frame's current display size (move only). Applied "
+        "before --crop in\n"
+        "    this run. LF and reference-only frames are rejected; a full-canvas "
+        "frame cannot\n"
+        "    be moved.",
+        &set_frame_regions, ParseSetFrameRegionsArg);
+    cmdline->AddHelpText(
+        "\nCodestream signal (TOC, noise, filtering, splines):", 0);
     cmdline->AddOptionValue(
         '\0', "group_order", "keep|0|progressive",
         "TOC section order in regular / skip-progressive frames.\n"
@@ -989,23 +1890,50 @@ struct Args {
         "unchanged.",
         &photon_iso, ParsePhotonIsoOpt);
     cmdline->AddOptionValue(
+        '\0', "set-epf-iters", "N",
+        "Set edge-preserving filter (EPF) iteration count (0–3) in the frame "
+        "restoration\n"
+        "bundle (same 2-bit field as libjxl). VarDCT fully-specified defaults "
+        "use 2;\n"
+        "modular defaults use 0. Enabling EPF on modular sets "
+        "epf_sigma_for_modular to 1.0\n"
+        "when it was unset/zero. LF and reference-only frames are skipped.",
+        &epf_iters, ParseEpfItersOpt);
+    cmdline->AddOptionValue(
+        '\0', "set-epf-amplitude-scale", "F",
+        "Scale overall EPF strength by factor F (>1 stronger, <1 weaker).\n"
+        "VarDCT: multiplies effective epf_quant_mul (implicit 0.46 when\n"
+        "epf_sigma_custom is false). Modular: multiplies epf_sigma_for_modular\n"
+        "(implicit 1.0). Values within tolerance of decoder defaults snap to\n"
+        "implicit encoding (VarDCT: epf_sigma_custom off; modular: sigma 1.0).\n"
+        "Skipped on frames with epf_iters==0 and on LF / reference-only frames.",
+        &epf_amp_scale, ParseEpfAmpScaleOpt);
+    cmdline->AddOptionValue(
+        '\0', "set-epf-uniformity", "U",
+        "VarDCT only (ignored on modular). When EPF is on, sets epf_sharp_lut "
+        "by mixing\n"
+        "the decoder default ramp {0,1/7,…,1} with all ones: U=0 keeps the "
+        "implicit\n"
+        "ramp (epf_sharp_custom off), U=1 is all ones, U=0.5 is in between. "
+        "LF and\n"
+        "reference-only frames are skipped.",
+        &epf_uniform, ParseEpfUniformOpt);
+    cmdline->AddOptionValue(
         '\0', "gab-blur", "A",
-        "Stronger reversible Gaborish blur than the encoder default (A>=0).\n"
-        "Uses the same unnormalized gab_x/y/b_weight1 and weight2 on all "
-        "channels,\n"
-        "scaled from libjxl defaults. Requires explicit frame headers; LF and\n"
-        "reference-only frames are skipped. Mutually exclusive with "
+        "Reversible Gaborish blur (A>=0). Per XYB channel, s=w1+w2 is moved in\n"
+        "logit space (s clamped to [-0.45, 2]); blur and sharpen use opposite\n"
+        "steps so the same A cancels. From the default kernel sum, sharpen A=1\n"
+        "moves s halfway toward the minimum (max sharp). Weights matching the\n"
+        "implicit encoder defaults snap to gab_custom off. Effective baseline:\n"
+        "gab off → 0, implicit default gab → libjxl defaults, custom → stored.\n"
+        "LF and reference-only frames are skipped. Mutually exclusive with\n"
         "--gab-sharpen and --gab-weights.",
         &gab_blur, StoreGabStringArg);
     cmdline->AddOptionValue(
         '\0', "gab-sharpen", "A",
-        "Sharpening by scaling default neighbor weights (A>=0). Larger A "
-        "pushes\n"
-        "gab_*_weight1/2 lower and can make them slightly negative for "
-        "stronger\n"
-        "sharpening; libjxl rejects only near-singular kernels where\n"
-        "|1+4*(weight1+weight2)| < 1e-8 per channel. LF and reference-only "
-        "frames are\n"
+        "Reversible Gaborish sharpen (A>=0): inverse of --gab-blur in logit(s)\n"
+        "with the same A. libjxl rejects only near-singular kernels where\n"
+        "|1+4*(w1+w2)| < 1e-8 per channel. LF and reference-only frames are\n"
         "skipped. Mutually exclusive with --gab-blur and --gab-weights.",
         &gab_sharpen, StoreGabStringArg);
     cmdline->AddOptionValue(
@@ -1018,59 +1946,6 @@ struct Args {
         "and\n"
         "--gab-sharpen.",
         &gab_weights, StoreGabStringArg);
-    cmdline->AddHelpText("\nDebugging:", 0);
-    cmdline->AddOptionFlag(
-        'v', "verbose",
-        "Log codestream header parse and rewrite to stderr.\n"
-        "Each line: BYTE+BIT | field | value. Positions are absolute from the "
-        "start of the codestream (reads) or from the start of the written "
-        "codestream (writes), split as byte offset + bit index within that "
-        "byte.",
-        &verbose, &jpegxl::tools::SetBooleanTrue);
-    cmdline->AddOptionFlag(
-        '\0', "info",
-        "Print oriented display dimensions, animation flag, and one "
-        "frame_region line per frame (WxH+X+Y in display space, same "
-        "orientation as dimensions), then exit. No OUTPUT file; cannot be "
-        "combined with transform or remux options.",
-        &info, &jpegxl::tools::SetBooleanTrue);
-    cmdline->AddOptionValue(
-        '\0', "extract-icc", "FILE",
-        "Write the codestream-embedded ICC profile to FILE (when present) and "
-        "exit. No OUTPUT file; same combination rules as --info (only "
-        "optional -v/--verbose).",
-        &extract_icc, StoreExtractIccPath);
-    cmdline->AddOptionValue(
-        '\0', "extract-exif", "FILE",
-        "Write the first Exif box payload to FILE (raw TIFF Exif block) and "
-        "exit.\n"
-        "brob-wrapped Exif is decompressed when jxltran is built with brotli. "
-        "No\n"
-        "OUTPUT file; same combination rules as --extract-icc.",
-        &extract_exif, StoreExtractIccPath);
-    cmdline->AddOptionValue(
-        '\0', "extract-xmp", "FILE",
-        "Write the first XMP metadata box (type xml ) payload to FILE and "
-        "exit.\n"
-        "brob-wrapped XMP is decompressed when built with brotli. No OUTPUT; "
-        "same\n"
-        "rules as --extract-icc.",
-        &extract_xmp, StoreExtractIccPath);
-    cmdline->AddOptionValue(
-        '\0', "extract-jumbf", "FILE",
-        "Write the first JUMBF box (type jumb) payload to FILE and exit.\n"
-        "brob-wrapped JUMBF is decompressed when built with brotli. No OUTPUT; "
-        "same\n"
-        "rules as --extract-icc.",
-        &extract_jumbf, StoreExtractIccPath);
-    cmdline->AddOptionValue(
-        '\0', "extract-splines", "FILE",
-        "Write LF-global spline geometry and quantized coefficients as text "
-        "and exit.\n"
-        "Format matches --set-splines-from. Optional --frames selects codestream "
-        "frames.\n"
-        "No OUTPUT; same combination rules as --extract-icc.",
-        &extract_splines, StoreExtractIccPath);
     cmdline->AddOptionValue(
         '\0', "set-splines-from", "FILE",
         "Replace LF-global spline bundles from FILE (from --extract-splines), or "
@@ -1084,30 +1959,26 @@ struct Args {
         "needed (downstream bit phase may shift). Not with photon-noise edit or\n"
         "stripped TOC permutation on the same pass.",
         &set_splines_from, StoreExtractIccPath);
-    cmdline->AddOptionValue(
-        '\0', "set-exif", "FILE",
-        "Replace (or add) the Exif metadata box with the contents of FILE. "
-        "Removes\n"
-        "any existing Exif and brob-wrapped Exif boxes. Bare codestream input is "
-        "wrapped\n"
-        "in a minimal container.",
-        &set_exif, StoreExtractIccPath);
-    cmdline->AddOptionValue(
-        '\0', "set-xmp", "FILE",
-        "Replace (or add) the XMP box (xml ) with the contents of FILE; same "
-        "semantics\n"
-        "as --set-exif.",
-        &set_xmp, StoreExtractIccPath);
-    cmdline->AddOptionValue(
-        '\0', "set-jumbf", "FILE",
-        "Replace (or add) the JUMBF box (jumb) with the contents of FILE; same "
-        "semantics\n"
-        "as --set-exif.",
-        &set_jumbf, StoreExtractIccPath);
+    cmdline->AddHelpText("\nDebugging:", 0);
+    cmdline->AddOptionFlag(
+        'v', "verbose",
+        "Log codestream header parse and rewrite to stderr.\n"
+        "Each line: BYTE+BIT | field | value. Positions are absolute from the "
+        "start of the codestream (reads) or from the start of the written "
+        "codestream (writes), split as byte offset + bit index within that "
+        "byte.",
+        &verbose, &jpegxl::tools::SetBooleanTrue);
   }
 };
 
 }  // namespace
+
+static uint32_t EpfItersEffectiveForInfo(const jxltran::FrameHeader& fh) {
+  if (fh.restoration.all_default) {
+    return (fh.encoding == jxltran::kFrameEncModular) ? 0u : 2u;
+  }
+  return std::min(3u, fh.restoration.epf_iters);
+}
 
 static bool InfoModeUsesNonDefaultOptions(const Args& a) {
   return a.container != ContainerOpt::kAsIs || a.jxlp != JxlpOpt::kAsIs ||
@@ -1116,10 +1987,47 @@ static bool InfoModeUsesNonDefaultOptions(const Args& a) {
          a.brob.mode != jxltran::BrobOpt::kAsIs || a.set_orientation != 0 ||
          a.rel_orientation != 0 || a.set_bits_per_sample != 0 ||
          a.num_loops.set || a.tps.set || a.crop.set || a.frames.set ||
+         a.keep_frames.set || a.keep_listed_frames ||
          a.group_order != jxltran::TocGroupOrderCli::kKeep || a.photon_iso.set ||
          a.set_splines_from != nullptr || a.gab_blur != nullptr ||
          a.gab_sharpen != nullptr || a.gab_weights != nullptr ||
-         a.NeedsOpsinAdjust();
+         a.NeedsEpfIters() || a.NeedsEpfAmpScale() || a.NeedsEpfUniformity() ||
+         a.NeedsOpsinAdjust() || a.NeedsSetFrameBlends() ||
+         a.NeedsSetFrameDurations() || a.NeedsSetFrameNames() ||
+         a.NeedsSetFrameRegions() || a.append_jxl != nullptr ||
+         a.append_jxl_skip_compat_check || a.append_dummy_tail;
+}
+
+static const char* FrameTypeInfoSlug(uint32_t ft) {
+  switch (ft) {
+    case jxltran::kFrameTypeRegular:
+      return "regular";
+    case jxltran::kFrameTypeLF:
+      return "lf";
+    case jxltran::kFrameTypeReferenceOnly:
+      return "ref_only";
+    case jxltran::kFrameTypeSkipProgressive:
+      return "skip_prog";
+    default:
+      return "unknown";
+  }
+}
+
+static const char* BlendModeInfoSlug(uint32_t m) {
+  switch (m) {
+    case 0:
+      return "replace";
+    case 1:
+      return "add";
+    case 2:
+      return "blend";
+    case 3:
+      return "alpha_weighted_add";
+    case 4:
+      return "mul";
+    default:
+      return "unknown";
+  }
 }
 
 static void PrintJxlInfoStdout(const jxltran::ParsedCodestream& parsed) {
@@ -1135,6 +2043,15 @@ static void PrintJxlInfoStdout(const jxltran::ParsedCodestream& parsed) {
          parsed.image.metadata.have_animation ? "yes" : "no");
   printf("xyb_encoded: %s\n",
          parsed.image.metadata.xyb_encoded ? "yes" : "no");
+  printf("num_extra: %" PRIu32 "\n", parsed.image.metadata.num_extra);
+  bool has_alpha_channel = false;
+  for (const auto& ec : parsed.image.metadata.ec_info) {
+    if (ec.type == jxltran::ExtraChannelType::kAlpha) {
+      has_alpha_channel = true;
+      break;
+    }
+  }
+  printf("has_alpha_channel: %s\n", has_alpha_channel ? "yes" : "no");
 
   for (size_t i = 0; i < parsed.frames.size(); ++i) {
     const jxltran::FrameHeader& fh = parsed.frames[i].frame;
@@ -1173,7 +2090,85 @@ static void PrintJxlInfoStdout(const jxltran::ParsedCodestream& parsed) {
     }
     printf("frame_upsampling: %" PRIuS " %u\n", i,
            std::max<uint32_t>(1u, fh.upsampling));
+    const uint32_t ft = fh.frame_type;
+    const char* encslug = "-";
+    if (ft == jxltran::kFrameTypeRegular ||
+        ft == jxltran::kFrameTypeSkipProgressive) {
+      encslug = (fh.encoding == jxltran::kFrameEncModular) ? "modular" : "vardct";
+    }
+    printf("frame_layer: %" PRIuS " type=%s encoding=%s", i, FrameTypeInfoSlug(ft),
+           encslug);
+    if (ft == jxltran::kFrameTypeRegular ||
+        ft == jxltran::kFrameTypeSkipProgressive) {
+      printf(" blend=%s duration=%" PRIu32 " alpha_ch=%" PRIu32
+             " clamp=%u source=%" PRIu32 " target=%" PRIu32 " is_last=%u",
+             BlendModeInfoSlug(fh.blending_info.mode),
+             parsed.image.metadata.have_animation ? fh.duration : 0u,
+             fh.blending_info.alpha_channel,
+             fh.blending_info.clamp ? 1u : 0u, fh.blending_info.source,
+             (!fh.is_last) ? fh.save_as_reference : 0u,
+             fh.is_last ? 1u : 0u);
+    } else {
+      fputs(" blend=skip duration=0", stdout);
+    }
+    if (!fh.name.empty()) {
+      fputs(" name_hex=", stdout);
+      for (uint8_t c : fh.name) printf("%02x", c);
+    }
+    fputc('\n', stdout);
+    if (ft != jxltran::kFrameTypeLF &&
+        ft != jxltran::kFrameTypeReferenceOnly) {
+      float ew[6];
+      jxltran::GabEffectiveWeights6(
+          fh.encoding == jxltran::kFrameEncModular, fh.restoration.all_default,
+          fh.restoration, ew);
+      printf("gab_effective: %" PRIuS
+             " %.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n",
+             i, ew[0], ew[1], ew[2], ew[3], ew[4], ew[5]);
+      const uint32_t epf_it = EpfItersEffectiveForInfo(fh);
+      printf("epf_iters: %" PRIuS " %u\n", i, epf_it);
+      float epf_amp = 0.f;
+      if (jxltran::EpfEffectiveAmplitudeForInfo(
+              fh.encoding == jxltran::kFrameEncModular,
+              fh.restoration.all_default, fh.restoration, &epf_amp)) {
+        printf("epf_amp_effective: %" PRIuS " %.9g\n", i, epf_amp);
+      }
+      const bool vardct = (fh.encoding != jxltran::kFrameEncModular);
+      printf("epf_uniform_applies: %" PRIuS " %u\n", i,
+             (vardct && epf_it > 0) ? 1u : 0u);
+      if (vardct && epf_it > 0) {
+        printf("epf_uniform_effective: %" PRIuS " %.9g\n", i,
+               jxltran::EpfSharpUniformityForInfo(fh.restoration.all_default,
+                                                  fh.restoration));
+      }
+    }
   }
+}
+
+// Replaces all jxlc/jxlp boxes with a single jxlc carrying |codestream|.
+static void ReplaceCodestreamInBoxes(std::vector<jxltran::JxlBox>* boxes,
+                                      std::vector<uint8_t> codestream) {
+  boxes->erase(
+      std::remove_if(
+          boxes->begin(), boxes->end(),
+          [](const jxltran::JxlBox& b) {
+            return memcmp(b.type, "jxlc", 4) == 0 ||
+                   memcmp(b.type, "jxlp", 4) == 0;
+          }),
+      boxes->end());
+  size_t insert_at = 0;
+  for (size_t i = 0; i < boxes->size(); ++i) {
+    if (memcmp((*boxes)[i].type, "JXL ", 4) == 0 ||
+        memcmp((*boxes)[i].type, "ftyp", 4) == 0 ||
+        memcmp((*boxes)[i].type, "jxll", 4) == 0) {
+      insert_at = i + 1;
+    }
+  }
+  jxltran::JxlBox jxlc;
+  memcpy(jxlc.type, "jxlc", 4);
+  jxlc.data = std::move(codestream);
+  boxes->insert(boxes->begin() + insert_at, std::move(jxlc));
+  PatchFtypMinorVersion(boxes, 0);
 }
 
 int main(int argc, const char* argv[]) {
@@ -1200,14 +2195,57 @@ int main(int argc, const char* argv[]) {
             "--gab-weights\n");
     return 1;
   }
-  if (args.frames.set && args.GabOptionCount() == 0 &&
+  if (args.frames.set && !args.keep_listed_frames &&
+      args.GabOptionCount() == 0 &&
       !args.NeedsPhotonNoiseIso() && !args.NeedsSplinesSet() &&
-      args.group_order == jxltran::TocGroupOrderCli::kKeep) {
+      args.group_order == jxltran::TocGroupOrderCli::kKeep &&
+      !args.NeedsEpfIters() && !args.NeedsEpfAmpScale() &&
+      !args.NeedsEpfUniformity() && !args.NeedsSetFrameBlends() &&
+      !args.NeedsSetFrameDurations() && !args.NeedsSetFrameNames() &&
+      !args.NeedsSetFrameRegions()) {
     fprintf(stderr,
             "jxltran: --frames requires at least one of --gab-blur, "
-            "--gab-sharpen, --gab-weights, --set-photon-noise-iso, "
-            "--set-splines-from, or a\n"
+            "--gab-sharpen, --gab-weights, --set-epf-iters, "
+            "--set-epf-amplitude-scale, --set-epf-uniformity, "
+            "--set-photon-noise-iso, "
+            "--set-splines-from, --set-frame-names, --set-frame-region, or a\n"
             "non-default --group_order\n");
+    return 1;
+  }
+  if (args.keep_frames.set && !args.keep_listed_frames) {
+    fprintf(stderr,
+            "jxltran: --keep-frames is only valid together with "
+            "--keep-listed-frames\n");
+    return 1;
+  }
+  if (args.keep_listed_frames) {
+    if (!args.keep_frames.set && !args.frames.set) {
+      fprintf(stderr,
+              "jxltran: --keep-listed-frames requires --keep-frames or --frames\n");
+      return 1;
+    }
+    if (!args.file_out) {
+      fprintf(stderr,
+              "jxltran: --keep-listed-frames requires an OUTPUT file\n");
+      return 1;
+    }
+  }
+  if (args.append_jxl && !args.file_out) {
+    fprintf(stderr, "jxltran: --append-jxl requires OUTPUT.\n");
+    return 1;
+  }
+  if (args.append_dummy_tail && !args.file_out) {
+    fprintf(stderr, "jxltran: --append-dummy-tail requires OUTPUT.\n");
+    return 1;
+  }
+  if (args.append_jxl_skip_compat_check && !args.append_jxl) {
+    fprintf(stderr,
+            "jxltran: --append-jxl-skip-compat-check requires --append-jxl\n");
+    return 1;
+  }
+  if (args.append_dummy_tail && args.append_jxl) {
+    fprintf(stderr,
+            "jxltran: do not combine --append-dummy-tail with --append-jxl\n");
     return 1;
   }
   if ((args.extract_exif && args.set_exif) ||
@@ -1435,13 +2473,69 @@ int main(int argc, const char* argv[]) {
     }
   }
 
+  if (args.append_jxl || args.append_dummy_tail) {
+    std::vector<uint8_t> append_cs;
+    if (args.append_dummy_tail) {
+      append_cs = jxltran::BuiltinAppendDummyTailCodestream();
+    } else {
+      std::vector<uint8_t> append_file;
+      if (!ReadFile(args.append_jxl, &append_file)) return 1;
+      const bool append_is_cont =
+          jxltran::IsJxlContainer(append_file.data(), append_file.size());
+      const bool append_is_raw =
+          jxltran::IsJxlCodestream(append_file.data(), append_file.size());
+      if (!append_is_cont && !append_is_raw) {
+        fprintf(stderr, "jxltran: --append-jxl: not a JPEG XL file\n");
+        return 1;
+      }
+      std::vector<jxltran::JxlBox> append_boxes;
+      if (append_is_cont) {
+        if (!jxltran::ParseBoxes(append_file.data(), append_file.size(),
+                                 &append_boxes)) {
+          return 1;
+        }
+        if (!jxltran::ReassembleCodestream(append_boxes, &append_cs)) return 1;
+      } else {
+        append_cs = std::move(append_file);
+      }
+    }
+
+    std::vector<uint8_t> primary_cs;
+    if (is_container) {
+      if (!jxltran::ReassembleCodestream(boxes, &primary_cs)) return 1;
+    } else {
+      primary_cs = codestream;
+    }
+
+    const bool skip_header_compat =
+        args.append_dummy_tail || args.append_jxl_skip_compat_check;
+    std::string append_err;
+    std::vector<uint8_t> merged_cs;
+    if (!jxltran::AppendCodestreamMerge(primary_cs, append_cs, &merged_cs,
+                                        &append_err, skip_header_compat)) {
+      const char* append_label =
+          args.append_dummy_tail ? "--append-dummy-tail" : "--append-jxl";
+      fprintf(stderr, "jxltran: %s: %s\n", append_label, append_err.c_str());
+      return 1;
+    }
+    if (is_container) {
+      ReplaceCodestreamInBoxes(&boxes, std::move(merged_cs));
+    } else {
+      codestream = std::move(merged_cs);
+    }
+  }
+
   // ── Codestream transforms (read → mutate ParsedCodestream → write)
   // ───────────
   const bool needs_codestream_transform =
       args.NeedsHeaderMod() || args.crop.set || args.GabOptionCount() > 0 ||
       args.NeedsPhotonNoiseIso() || args.NeedsSplinesSet() ||
+      args.NeedsEpfIters() || args.NeedsEpfAmpScale() ||
+      args.NeedsEpfUniformity() ||
       args.group_order != jxltran::TocGroupOrderCli::kKeep ||
-      args.NeedsOpsinAdjust();
+      args.NeedsOpsinAdjust() || args.NeedsKeepListedFrames() ||
+      args.NeedsSetFrameBlends() || args.NeedsSetFrameDurations() ||
+      args.NeedsSetFrameNames() || args.NeedsSetFrameRegions();
   if (needs_codestream_transform) {
     auto transform_codestream = [&](std::vector<uint8_t>* cs) -> bool {
       const uint8_t* orig_bytes = cs->data();
@@ -1454,6 +2548,7 @@ int main(int argc, const char* argv[]) {
           !ResolveTpsPercentFromMetadata(parsed.image.metadata, &args.tps)) {
         return false;
       }
+      bool wrote_anything = args.NeedsHeaderMod();
       uint32_t input_orient_for_crop = parsed.image.metadata.orientation;
       if (input_orient_for_crop < 1 || input_orient_for_crop > 8) {
         input_orient_for_crop = 1;
@@ -1480,7 +2575,6 @@ int main(int argc, const char* argv[]) {
         mod.set_tps_denominator = args.tps.denominator;
         if (!jxltran::ApplyHeaderMod(&parsed, mod)) return false;
       }
-      bool wrote_anything = args.NeedsHeaderMod();
       if (args.NeedsOpsinAdjust()) {
         jxltran::OpsinAdjustParams oa;
         if (args.opsin_exposure.set) oa.exposure_ev = args.opsin_exposure.value;
@@ -1494,6 +2588,18 @@ int main(int argc, const char* argv[]) {
           return false;
         }
         if (opsin_changed) wrote_anything = true;
+      }
+      if (args.set_frame_regions.set) {
+        for (const auto& pr : args.set_frame_regions.pairs) {
+          const CropArg& cr = pr.second;
+          bool fr_changed = false;
+          if (!jxltran::ApplySetFrameRegionFromDisplay(
+                  &parsed, pr.first, input_orient_for_crop, cr.x, cr.y, cr.w,
+                  cr.h, &fr_changed)) {
+            return false;
+          }
+          if (fr_changed) wrote_anything = true;
+        }
       }
       if (args.crop.set) {
         int32_t crop_x = args.crop.x;
@@ -1524,6 +2630,29 @@ int main(int argc, const char* argv[]) {
         if (!jxltran::ApplyGabArgs(&parsed, gab_args, frame_sel)) return false;
         wrote_anything = true;
       }
+      if (args.NeedsEpfIters()) {
+        if (!jxltran::ApplyEpfIters(&parsed, args.epf_iters.iters, frame_sel)) {
+          return false;
+        }
+        wrote_anything = true;
+      }
+      if (args.NeedsEpfAmpScale()) {
+        if (!jxltran::ApplyEpfAmplitudeScale(&parsed, args.epf_amp_scale.factor,
+                                            frame_sel)) {
+          return false;
+        }
+        if (args.epf_amp_scale.factor != 1.f) {
+          wrote_anything = true;
+        }
+      }
+      if (args.NeedsEpfUniformity()) {
+        bool epf_u_changed = false;
+        if (!jxltran::ApplyEpfSharpUniformity(&parsed, args.epf_uniform.value,
+                                              frame_sel, &epf_u_changed)) {
+          return false;
+        }
+        if (epf_u_changed) wrote_anything = true;
+      }
       if (args.group_order != jxltran::TocGroupOrderCli::kKeep) {
         bool toc_changed = false;
         if (!jxltran::ApplyTocGroupOrder(&parsed, args.group_order, args.center_x,
@@ -1547,6 +2676,36 @@ int main(int argc, const char* argv[]) {
         }
         wrote_anything = true;
       }
+      if (args.NeedsSetFrameBlends()) {
+        if (!jxltran::ApplyFrameBlendOverrides(&parsed,
+                                              args.set_frame_blends.overrides)) {
+          return false;
+        }
+        wrote_anything = true;
+      }
+      if (args.NeedsSetFrameDurations()) {
+        if (!jxltran::ApplyFrameDurationOverrides(
+                &parsed, args.set_frame_durations.pairs)) {
+          return false;
+        }
+        wrote_anything = true;
+      }
+      if (args.NeedsKeepListedFrames()) {
+        bool keep_changed = false;
+        const std::vector<size_t>& keep_order =
+            args.keep_frames.set ? args.keep_frames.indices_ordered
+                                 : args.frames.indices_ordered;
+        if (!jxltran::ApplyKeepListedFrames(&parsed, keep_order, &keep_changed)) {
+          return false;
+        }
+        if (keep_changed) wrote_anything = true;
+      }
+      if (args.NeedsSetFrameNames()) {
+        if (!jxltran::ApplySetFrameNames(&parsed, args.set_frame_names.pairs)) {
+          return false;
+        }
+        wrote_anything = true;
+      }
       if (!wrote_anything) {
         return true;
       }
@@ -1557,25 +2716,7 @@ int main(int argc, const char* argv[]) {
     };
 
     auto replace_codestream_boxes = [&](std::vector<uint8_t> cs) {
-      boxes.erase(std::remove_if(boxes.begin(), boxes.end(),
-                                 [](const jxltran::JxlBox& b) {
-                                   return memcmp(b.type, "jxlc", 4) == 0 ||
-                                          memcmp(b.type, "jxlp", 4) == 0;
-                                 }),
-                  boxes.end());
-      size_t insert_at = 0;
-      for (size_t i = 0; i < boxes.size(); ++i) {
-        if (memcmp(boxes[i].type, "JXL ", 4) == 0 ||
-            memcmp(boxes[i].type, "ftyp", 4) == 0 ||
-            memcmp(boxes[i].type, "jxll", 4) == 0) {
-          insert_at = i + 1;
-        }
-      }
-      jxltran::JxlBox jxlc;
-      memcpy(jxlc.type, "jxlc", 4);
-      jxlc.data = std::move(cs);
-      boxes.insert(boxes.begin() + insert_at, std::move(jxlc));
-      PatchFtypMinorVersion(&boxes, 0);
+      ReplaceCodestreamInBoxes(&boxes, std::move(cs));
     };
 
     if (is_container) {

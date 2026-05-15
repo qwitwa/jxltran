@@ -15,6 +15,33 @@
 namespace jpegxl {
 namespace tools {
 
+namespace {
+
+// Prints each line of help with the same leading indent. Leading spaces on each
+// line are stripped so wrapped prose and enum lists stay aligned in the source
+// without double-indenting in the terminal.
+void PrintMultilineHelpText(FILE* out, const char* help_text) {
+  if (help_text == nullptr || help_text[0] == '\0') return;
+  const char* p = help_text;
+  while (*p != '\0') {
+    const char* nl = std::strchr(p, '\n');
+    const char* end = nl != nullptr ? nl : p + std::strlen(p);
+    const char* q = p;
+    while (q < end && (*q == ' ' || *q == '\t')) ++q;
+    if (q == end) {
+      std::fputc('\n', out);
+    } else {
+      std::fputs("    ", out);
+      std::fwrite(q, 1, static_cast<size_t>(end - q), out);
+      std::fputc('\n', out);
+    }
+    if (nl == nullptr) break;
+    p = nl + 1;
+  }
+}
+
+}  // namespace
+
 void CommandLineParser::PrintHelp() const {
   // Use stdout, not stderr, so help can easily be grepped.
   FILE* out = stdout;
@@ -47,7 +74,7 @@ void CommandLineParser::PrintHelp() const {
     fprintf(out, " %s\n", option->help_flags().c_str());
     const char* help_text = option->help_text();
     if (help_text) {
-      fprintf(out, "    %s\n", help_text);
+      PrintMultilineHelpText(out, help_text);
     }
   }
   fprintf(out, "\n -h, --help\n    Prints this help message. ");

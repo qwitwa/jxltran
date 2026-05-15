@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <climits>
 #include <limits>
 
 namespace jxltran {
@@ -254,6 +255,89 @@ bool ConvertDisplayCropToStorageCanvas(uint32_t orientation,
   *out_y = static_cast<int32_t>(min_sy);
   *out_w = static_cast<uint32_t>(rw);
   *out_h = static_cast<uint32_t>(rh);
+  return true;
+}
+
+bool DisplayAabbMinToStorageCropOrigin(uint32_t orientation, uint32_t storage_w,
+                                      uint32_t storage_h, int64_t display_min_x,
+                                      int64_t display_min_y, uint64_t rect_w,
+                                      uint64_t rect_h, int32_t* out_sx0,
+                                      int32_t* out_sy0) {
+  if (orientation < 1 || orientation > 8) {
+    fprintf(stderr,
+            "jxltran: internal error: orientation %" PRIu32 " out of range\n",
+            orientation);
+    return false;
+  }
+  if (rect_w == 0 || rect_h == 0) {
+    fprintf(stderr,
+            "jxltran: --set-frame-region: frame width/height must be positive\n");
+    return false;
+  }
+  const int64_t sw = static_cast<int64_t>(storage_w);
+  const int64_t sh = static_cast<int64_t>(storage_h);
+  const int64_t fw = static_cast<int64_t>(rect_w);
+  const int64_t fh = static_cast<int64_t>(rect_h);
+  int64_t sx0 = 0;
+  int64_t sy0 = 0;
+  switch (orientation) {
+    case 1:
+      sx0 = display_min_x;
+      sy0 = display_min_y;
+      break;
+    case 2:
+      sx0 = sw - fw - display_min_x;
+      sy0 = display_min_y;
+      break;
+    case 3:
+      sx0 = sw - fw - display_min_x;
+      sy0 = sh - fh - display_min_y;
+      break;
+    case 4:
+      sx0 = display_min_x;
+      sy0 = sh - fh - display_min_y;
+      break;
+    case 5:
+      sy0 = display_min_x;
+      sx0 = display_min_y;
+      break;
+    case 6:
+      sy0 = sh - fh - display_min_x;
+      sx0 = display_min_y;
+      break;
+    case 7:
+      sy0 = sh - fh - display_min_x;
+      sx0 = sw - fw - display_min_y;
+      break;
+    case 8:
+      sy0 = display_min_x;
+      sx0 = sw - fw - display_min_y;
+      break;
+    default:
+      return false;
+  }
+  if (sx0 < INT32_MIN || sx0 > INT32_MAX || sy0 < INT32_MIN ||
+      sy0 > INT32_MAX) {
+    fprintf(stderr,
+            "jxltran: --set-frame-region: converted origin out of int32 range\n");
+    return false;
+  }
+  *out_sx0 = static_cast<int32_t>(sx0);
+  *out_sy0 = static_cast<int32_t>(sy0);
+  int64_t vdx = 0;
+  int64_t vdy = 0;
+  uint64_t vdw = 0;
+  uint64_t vdh = 0;
+  StorageRectToDisplayAabb(orientation, storage_w, storage_h,
+                           static_cast<int64_t>(*out_sx0),
+                           static_cast<int64_t>(*out_sy0), rect_w, rect_h, &vdx,
+                           &vdy, &vdw, &vdh);
+  if (vdx != display_min_x || vdy != display_min_y) {
+    fprintf(stderr,
+            "jxltran: --set-frame-region: display position is not achievable "
+            "for this orientation/size (internal check failed)\n");
+    return false;
+  }
   return true;
 }
 

@@ -60,6 +60,17 @@ bool ConvertDisplayCropToStorageCanvas(uint32_t orientation,
                                        int32_t* out_x, int32_t* out_y,
                                        uint32_t* out_w, uint32_t* out_h);
 
+// Inverse of StorageRectToDisplayAabb for a fixed-size axis-aligned storage
+// rectangle (rect_w × rect_h): find the storage origin (sx0, sy0) whose
+// display-space AABB top-left is (display_min_x, display_min_y). Returns false
+// if orientation is invalid, rect size is zero, or the target is not exactly
+// realizable (sanity check).
+bool DisplayAabbMinToStorageCropOrigin(uint32_t orientation, uint32_t storage_w,
+                                      uint32_t storage_h, int64_t display_min_x,
+                                      int64_t display_min_y, uint64_t rect_w,
+                                      uint64_t rect_h, int32_t* out_sx0,
+                                      int32_t* out_sy0);
+
 }  // namespace jxltran
 
 #endif  // TOOLS_JXLTRAN_SRC_ORIENTATION_COMPOSE_H_
