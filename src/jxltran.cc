@@ -28,6 +28,7 @@
 #include "frame_header.h"
 #include "image_header.h"
 #include "operations.h"
+#include "reversible_undo.h"
 #include "opsin_adjust.h"
 #include "orientation_compose.h"
 #include "printf_macros.h"
@@ -41,6 +42,21 @@ namespace {
 // CLI value meaning "leave unchanged". Legacy alias "as-is" is still accepted.
 static bool ParseKeepToken(const char* str) {
   return strcmp(str, "keep") == 0 || strcmp(str, "as-is") == 0;
+}
+
+// Print `reversible_undo:` once: multi-line (indented) when flags are present so
+// bug reports stay readable without duplicate one-line / pretty variants.
+static void PrintReversibleUndoLine(const std::string& undo_line) {
+  if (undo_line.find(" --") == std::string::npos) {
+    printf("reversible_undo: %s\n", undo_line.c_str());
+    return;
+  }
+  std::string pretty = undo_line;
+  for (size_t p = 0; (p = pretty.find(" --", p)) != std::string::npos;) {
+    pretty.replace(p, 1, "\n  ");
+    p += 3;
+  }
+  printf("reversible_undo:\n  %s\n", pretty.c_str());
 }
 
 static bool StoreExtractIccPath(const char* s, const char** out) {
@@ -751,6 +767,97 @@ static bool ParseFramesArg(const char* s, FramesArg* out) {
   return true;
 }
 
+struct LfChunk0TailTrimArg {
+  bool set = false;
+  /** (codestream frame index, trim 1..255 whole tail bytes of physical chunk0). */
+  std::vector<std::pair<size_t, uint8_t>> pairs;
+};
+
+static bool ParseLfChunk0TailTrimArg(const char* s, LfChunk0TailTrimArg* out) {
+  out->set = true;
+  out->pairs.clear();
+  if (s == nullptr || s[0] == '\0') {
+    fprintf(stderr,
+            "jxltran: --lf-global-chunk0-tail-trim-bytes expects "
+            "FRAME:BYTES[,FRAME:BYTES] (BYTES is 1..255)\n");
+    return false;
+  }
+  const char* p = s;
+  while (*p != '\0') {
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') break;
+    char* end = nullptr;
+    unsigned long fi = strtoul(p, &end, 10);
+    if (end == p) {
+      fprintf(stderr,
+              "jxltran: --lf-global-chunk0-tail-trim-bytes: invalid frame index "
+              "near '%s'\n",
+              p);
+      return false;
+    }
+    if (fi > static_cast<unsigned long>((std::numeric_limits<size_t>::max)())) {
+      fprintf(stderr,
+              "jxltran: --lf-global-chunk0-tail-trim-bytes: frame index out of "
+              "range near '%s'\n",
+              p);
+      return false;
+    }
+    if (*end != ':') {
+      fprintf(stderr,
+              "jxltran: --lf-global-chunk0-tail-trim-bytes: expected ':' after "
+              "frame index near '%s'\n",
+              end);
+      return false;
+    }
+    p = end + 1;
+    unsigned long tb = strtoul(p, &end, 10);
+    if (end == p || (*end != '\0' && *end != ',' && *end != ' ' && *end != '\t')) {
+      fprintf(stderr,
+              "jxltran: --lf-global-chunk0-tail-trim-bytes: invalid byte count "
+              "near '%s'\n",
+              p);
+      return false;
+    }
+    if (tb < 1 || tb > 255) {
+      fprintf(stderr,
+              "jxltran: --lf-global-chunk0-tail-trim-bytes: byte count must be 1..255 "
+              "(got %lu)\n",
+              static_cast<unsigned long>(tb));
+      return false;
+    }
+    const size_t frame_i = static_cast<size_t>(fi);
+    for (const auto& pr : out->pairs) {
+      if (pr.first == frame_i) {
+        fprintf(stderr,
+                "jxltran: --lf-global-chunk0-tail-trim-bytes: duplicate frame "
+                "%" PRIuS "\n",
+                frame_i);
+        return false;
+      }
+    }
+    out->pairs.emplace_back(frame_i, static_cast<uint8_t>(tb));
+    p = end;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == ',') {
+      ++p;
+      continue;
+    }
+    if (*p == '\0') break;
+    fprintf(stderr,
+            "jxltran: --lf-global-chunk0-tail-trim-bytes: expected ',' or end "
+            "near '%s'\n",
+            p);
+    return false;
+  }
+  if (out->pairs.empty()) {
+    fprintf(stderr,
+            "jxltran: --lf-global-chunk0-tail-trim-bytes needs at least one "
+            "FRAME:BYTES entry\n");
+    return false;
+  }
+  return true;
+}
+
 struct KeepFramesArg {
   bool set = false;
   std::vector<size_t> indices;
@@ -844,9 +951,12 @@ static bool ParseSetFrameNamesArg(const char* s, SetFrameNamesArg* out) {
   out->pairs.clear();
   if (s == nullptr || s[0] == '\0') {
     fprintf(stderr,
-            "jxltran: --set-frame-names expects INDEX:HEX pairs "
-            "(comma-separated); HEX is an even-length hex string (UTF-8 "
-            "bytes, same as --info name_hex=); omit HEX to clear the name\n");
+            "jxltran: --set-frame-names expects INDEX:VALUE pairs "
+            "(comma-separated); VALUE is an even-length hex string (UTF-8 bytes, "
+            "same as --info name_hex=), a literal UTF-8 run when it is not "
+            "even-length all-hex, or a double-quoted literal (spaces, commas, "
+            "hex-like ASCII, …; use \\\" and \\\\ inside quotes); use INDEX: "
+            "alone to clear the name\n");
     return false;
   }
   const char* p = s;
@@ -879,43 +989,78 @@ static bool ParseSetFrameNamesArg(const char* s, SetFrameNamesArg* out) {
     }
     ++p;
     while (*p == ' ' || *p == '\t') ++p;
-    const char* hex_start = p;
-    while (std::isxdigit(static_cast<unsigned char>(*p))) ++p;
-    const size_t hex_len = static_cast<size_t>(p - hex_start);
-    if (hex_len % 2 != 0) {
-      fprintf(stderr,
-              "jxltran: --set-frame-names: hex length must be even (UTF-8 "
-              "bytes), got %" PRIuS " hex digits for frame %lu\n",
-              hex_len, static_cast<unsigned long>(fi));
-      return false;
-    }
     std::vector<uint8_t> name;
-    name.reserve(hex_len / 2);
-    for (size_t i = 0; i < hex_len; i += 2) {
-      const int hi = HexNibbleForFrameName(hex_start[i]);
-      const int lo = HexNibbleForFrameName(hex_start[i + 1]);
-      if (hi < 0 || lo < 0) {
-        fprintf(stderr,
-                "jxltran: --set-frame-names: invalid hex near '%s'\n",
-                hex_start);
-        return false;
+    if (*p == '"') {
+      ++p;
+      for (;;) {
+        if (*p == '\0') {
+          fprintf(stderr,
+                  "jxltran: --set-frame-names: unterminated quoted value in "
+                  "'%s'\n",
+                  s);
+          return false;
+        }
+        if (*p == '"') {
+          ++p;
+          break;
+        }
+        if (*p == '\\' && p[1] != '\0') {
+          ++p;
+          name.push_back(static_cast<uint8_t>(*p++));
+          continue;
+        }
+        name.push_back(static_cast<uint8_t>(*p++));
       }
-      name.push_back(static_cast<uint8_t>((hi << 4) | lo));
-    }
-    while (*p == ' ' || *p == '\t') ++p;
-    if (*p != '\0' && *p != ',') {
-      fprintf(stderr,
-              "jxltran: --set-frame-names: unexpected character after hex near "
-              "'%s'\n",
-              p);
-      return false;
+    } else {
+      const char* tok_start = p;
+      while (*p != '\0' && *p != ',') ++p;
+      const char* tok_end = p;
+      while (tok_end > tok_start &&
+             (tok_end[-1] == ' ' || tok_end[-1] == '\t')) {
+        --tok_end;
+      }
+      const size_t len = static_cast<size_t>(tok_end - tok_start);
+      if (len == 0) {
+        // clear
+      } else {
+        bool all_hex = true;
+        for (size_t i = 0; i < len; ++i) {
+          if (!std::isxdigit(static_cast<unsigned char>(tok_start[i]))) {
+            all_hex = false;
+            break;
+          }
+        }
+        if (all_hex && (len % 2) == 0) {
+          name.reserve(len / 2);
+          for (size_t i = 0; i < len; i += 2) {
+            const int hi = HexNibbleForFrameName(tok_start[i]);
+            const int lo = HexNibbleForFrameName(tok_start[i + 1]);
+            if (hi < 0 || lo < 0) {
+              fprintf(stderr,
+                      "jxltran: --set-frame-names: invalid hex near '%.*s'\n",
+                      static_cast<int>(len), tok_start);
+              return false;
+            }
+            name.push_back(static_cast<uint8_t>((hi << 4) | lo));
+          }
+        } else {
+          name.assign(reinterpret_cast<const uint8_t*>(tok_start),
+                      reinterpret_cast<const uint8_t*>(tok_start) + len);
+        }
+      }
     }
     out->pairs.emplace_back(static_cast<size_t>(fi), std::move(name));
+    while (*p == ' ' || *p == '\t') ++p;
     if (*p == ',') {
       ++p;
       continue;
     }
     if (*p == '\0') break;
+    fprintf(stderr,
+            "jxltran: --set-frame-names: expected ',' or end of string near "
+            "'%s'\n",
+            p);
+    return false;
   }
   if (out->pairs.empty()) {
     fprintf(stderr, "jxltran: --set-frame-names needs at least one pair\n");
@@ -1427,6 +1572,7 @@ struct Args {
   OpsinFloatOpt opsin_temperature;
   OpsinFloatOpt opsin_tint;
   OpsinFloatOpt opsin_hue;
+  bool opsin_inverse = false;
   CropArg crop;
   FramesArg frames;
   KeepFramesArg keep_frames;
@@ -1439,6 +1585,7 @@ struct Args {
   int64_t center_x = -1;
   int64_t center_y = -1;
   PhotonIsoArg photon_iso;
+  const char* photon_weights = nullptr;
   EpfItersArg epf_iters;
   EpfAmpScaleArg epf_amp_scale;
   EpfUniformArg epf_uniform;
@@ -1451,10 +1598,13 @@ struct Args {
   const char* extract_jumbf = nullptr;
   const char* extract_splines = nullptr;
   const char* set_splines_from = nullptr;
+  FramesArg clear_splines_frames;
+  LfChunk0TailTrimArg lf_chunk0_tail_trim;
   const char* set_exif = nullptr;
   const char* set_xmp = nullptr;
   const char* set_jumbf = nullptr;
   bool verbose = false;
+  bool check_reversible = false;
   const char* append_jxl = nullptr;
   bool append_jxl_skip_compat_check = false;
   bool append_dummy_tail = false;
@@ -1476,6 +1626,12 @@ struct Args {
 
   bool NeedsPhotonNoiseIso() const { return photon_iso.set; }
 
+  bool NeedsPhotonNoiseWeights() const { return photon_weights != nullptr; }
+
+  bool NeedsPhotonNoiseAny() const {
+    return NeedsPhotonNoiseIso() || NeedsPhotonNoiseWeights();
+  }
+
   bool NeedsEpfIters() const { return epf_iters.set; }
 
   bool NeedsEpfAmpScale() const { return epf_amp_scale.set; }
@@ -1483,6 +1639,10 @@ struct Args {
   bool NeedsEpfUniformity() const { return epf_uniform.set; }
 
   bool NeedsSplinesSet() const { return set_splines_from != nullptr; }
+
+  bool NeedsClearSplinesFrames() const { return clear_splines_frames.set; }
+
+  bool NeedsLfGlobalChunk0TailTrim() const { return lf_chunk0_tail_trim.set; }
 
   bool NeedsKeepListedFrames() const { return keep_listed_frames; }
 
@@ -1679,7 +1839,9 @@ struct Args {
         "XYB only: exposure in stops (linear RGB after XYB→RGB). Reversible via\n"
         "    a non-default OpsinInverseMatrix (CustomTransformData). Range about "
         "±10.\n"
-        "    Combine with --opsin-temperature / --opsin-tint / --opsin-hue.",
+        "    Combine with --opsin-temperature / --opsin-tint / --opsin-hue. "
+        "reversible_undo\n"
+        "    uses --opsin-inverse with the same magnitudes (not negated).",
         &opsin_exposure, ParseOpsinExposureOpt);
     cmdline->AddOptionValue(
         '\0', "opsin-temperature", "T",
@@ -1697,6 +1859,15 @@ struct Args {
         "XYB only: small hue rotation in the linear R–B plane, −100..+100 "
         "(~±5° at extremes).",
         &opsin_hue, ParseOpsinHueOpt);
+    cmdline->AddOptionFlag(
+        '\0', "opsin-inverse",
+        "XYB only: apply the exact inverse of a prior opsin slider pass. Use the "
+        "same\n"
+        "    --opsin-exposure / --opsin-temperature / --opsin-tint / --opsin-hue "
+        "*values*\n"
+        "    as the forward run (do not negate). At least one of those sliders "
+        "must be set.",
+        &opsin_inverse, &jpegxl::tools::SetBooleanTrue);
     cmdline->AddHelpText("\nCrop:", 0);
     cmdline->AddOptionValue(
         '\0', "crop", "WxH or WxHXY",
@@ -1818,14 +1989,18 @@ struct Args {
         "Requires have_animation in the codestream.",
         &set_frame_durations, ParseSetFrameDurationsArg);
     cmdline->AddOptionValue(
-        '\0', "set-frame-names", "INDEX:HEX[,INDEX:HEX...]",
+        '\0', "set-frame-names", "INDEX:VALUE[,INDEX:VALUE...]",
         "Set per-frame name bytes (UTF-8) on regular / skip-progressive "
         "frames.\n"
-        "    HEX : even-length hex (same encoding as `name_hex=` from "
-        "--info). Use INDEX:\n"
-        "          with no hex digits to clear the name. Indices refer to "
-        "codestream order\n"
-        "          after other edits in this run (e.g. after "
+        "    VALUE : even-length hex (same encoding as `name_hex=` from "
+        "--info), an unquoted\n"
+        "            literal when it is not even-length all-hex (no spaces), "
+        "or a double-quoted\n"
+        "            literal for spaces, commas, hex-like ASCII, etc. "
+        "(use \\\" and \\\\ inside quotes).\n"
+        "            Use INDEX: with nothing after ':' to clear. Indices "
+        "refer to codestream order\n"
+        "            after other edits in this run (e.g. after "
         "--keep-listed-frames).",
         &set_frame_names, ParseSetFrameNamesArg);
     cmdline->AddOptionValue(
@@ -1887,6 +2062,16 @@ struct Args {
         "U32 size codewords are re-encoded. Compressed sample values are "
         "unchanged.",
         &photon_iso, ParsePhotonIsoOpt);
+    cmdline->AddOptionValue(
+        '\0', "set-photon-noise-weights", "WEIGHTS",
+        "Like --set-photon-noise-iso but set the 8×10-bit LUT directly: either "
+        "eight\n"
+        "comma-separated floats (same scale as the ISO model LUT) or 20 hex "
+        "digits for\n"
+        "the verbatim 10-byte bitstream block. All-zero / empty LUT removes "
+        "kNoise.\n"
+        "Mutually exclusive with --set-photon-noise-iso on the same run.",
+        &photon_weights, StoreGabStringArg);
     cmdline->AddOptionValue(
         '\0', "set-epf-iters", "N",
         "Set edge-preserving filter (EPF) iteration count (0–3) in the frame "
@@ -1954,9 +2139,31 @@ struct Args {
         "any\n"
         "bit length; the frame body stays byte-aligned with trailing zero bits "
         "when\n"
-        "needed (downstream bit phase may shift). Not with photon-noise edit or\n"
-        "stripped TOC permutation on the same pass.",
+        "needed (downstream bit phase may shift). Incompatible with stripped TOC\n"
+        "permutation on the same pass.",
         &set_splines_from, StoreExtractIccPath);
+    cmdline->AddOptionValue(
+        '\0', "clear-splines-frames", "LIST",
+        "Remove LF-global spline bundles on the listed codestream frame indices "
+        "(comma-\n"
+        "separated, 0-based). Inverse of --set-splines-from when those frames had "
+        "no splines\n"
+        "before insertion. Mutually exclusive with --set-splines-from on the "
+        "same pass.\n"
+        "Standalone use is not in the reversible-undo scope.",
+        &clear_splines_frames, ParseFramesArg);
+    cmdline->AddOptionValue(
+        '\0', "lf-global-chunk0-tail-trim-bytes", "LIST",
+        "After --clear-splines-frames in the same pass, shrink LF-global physical "
+        "TOC\n"
+        "section 0 by LIST trailing whole zero bytes (syntax: FRAME:BYTES with "
+        "BYTES\n"
+        "1 or 2, comma-separated). Required for exact byte-for-byte undo when "
+        "spline\n"
+        "insert/remove left extra zero padding vs the pre-edit codestream. Each "
+        "FRAME\n"
+        "must be listed in --clear-splines-frames.",
+        &lf_chunk0_tail_trim, ParseLfChunk0TailTrimArg);
     cmdline->AddHelpText("\nDebugging:", 0);
     cmdline->AddOptionFlag(
         'v', "verbose",
@@ -1966,6 +2173,18 @@ struct Args {
         "codestream (writes), split as byte offset + bit index within that "
         "byte.",
         &verbose, &jpegxl::tools::SetBooleanTrue);
+    cmdline->AddOptionFlag(
+        '\0', "check_reversible",
+        "After writing OUTPUT, verify lossless codestream round-trip: identity "
+        "copy\n"
+        "(no codestream-changing flags), or the emitted reversible_undo steps "
+        "vs the\n"
+        "codestream snapshot before transforms. --container remux (bare or "
+        "ISOBMFF)\n"
+        "and --group_order TOC rewrites use the same check. Prints "
+        "reversible_check:\n"
+        "not_reversible | ok | mismatch.",
+        &check_reversible, &jpegxl::tools::SetBooleanTrue);
   }
 };
 
@@ -1987,13 +2206,17 @@ static bool InfoModeUsesNonDefaultOptions(const Args& a) {
          a.num_loops.set || a.tps.set || a.crop.set || a.frames.set ||
          a.keep_frames.set || a.keep_listed_frames ||
          a.group_order != jxltran::TocGroupOrderCli::kKeep || a.photon_iso.set ||
-         a.set_splines_from != nullptr || a.gab_blur != nullptr ||
+         a.photon_weights != nullptr ||
+         a.set_splines_from != nullptr || a.clear_splines_frames.set ||
+         a.lf_chunk0_tail_trim.set ||
+         a.gab_blur != nullptr ||
          a.gab_sharpen != nullptr || a.gab_weights != nullptr ||
          a.NeedsEpfIters() || a.NeedsEpfAmpScale() || a.NeedsEpfUniformity() ||
-         a.NeedsOpsinAdjust() || a.NeedsSetFrameBlends() ||
+         a.NeedsOpsinAdjust() || a.opsin_inverse || a.NeedsSetFrameBlends() ||
          a.NeedsSetFrameDurations() || a.NeedsSetFrameNames() ||
          a.NeedsSetFrameRegions() || a.append_jxl != nullptr ||
-         a.append_jxl_skip_compat_check || a.append_dummy_tail;
+         a.append_jxl_skip_compat_check || a.append_dummy_tail ||
+         a.check_reversible;
 }
 
 static const char* FrameTypeInfoSlug(uint32_t ft) {
@@ -2037,6 +2260,7 @@ static void PrintJxlInfoStdout(const jxltran::ParsedCodestream& parsed) {
   const uint32_t canvas_h = parsed.image.size.height;
   jxltran::OrientedCanvasDimensions(orient, canvas_w, canvas_h, &dw, &dh);
   printf("dimensions: %u x %u\n", dw, dh);
+  printf("exif_orientation: %u\n", orient);
   printf("animation: %s\n",
          parsed.image.metadata.have_animation ? "yes" : "no");
   printf("xyb_encoded: %s\n",
@@ -2195,7 +2419,8 @@ int main(int argc, const char* argv[]) {
   }
   if (args.frames.set && !args.keep_listed_frames &&
       args.GabOptionCount() == 0 &&
-      !args.NeedsPhotonNoiseIso() && !args.NeedsSplinesSet() &&
+      !args.NeedsPhotonNoiseAny() && !args.NeedsSplinesSet() &&
+      !args.NeedsClearSplinesFrames() && !args.NeedsLfGlobalChunk0TailTrim() &&
       args.group_order == jxltran::TocGroupOrderCli::kKeep &&
       !args.NeedsEpfIters() && !args.NeedsEpfAmpScale() &&
       !args.NeedsEpfUniformity() && !args.NeedsSetFrameBlends() &&
@@ -2205,8 +2430,10 @@ int main(int argc, const char* argv[]) {
             "jxltran: --frames requires at least one of --gab-blur, "
             "--gab-sharpen, --gab-weights, --set-epf-iters, "
             "--set-epf-amplitude-scale, --set-epf-uniformity, "
-            "--set-photon-noise-iso, "
-            "--set-splines-from, --set-frame-names, --set-frame-region, or a\n"
+            "--set-photon-noise-iso, --set-photon-noise-weights, "
+            "--set-splines-from, --clear-splines-frames, "
+            "--lf-global-chunk0-tail-trim-bytes, --set-frame-names, "
+            "--set-frame-region, or a\n"
             "non-default --group_order\n");
     return 1;
   }
@@ -2245,6 +2472,31 @@ int main(int argc, const char* argv[]) {
     fprintf(stderr,
             "jxltran: do not combine --append-dummy-tail with --append-jxl\n");
     return 1;
+  }
+  if (args.NeedsSplinesSet() && args.NeedsClearSplinesFrames()) {
+    fprintf(stderr,
+            "jxltran: do not combine --set-splines-from with "
+            "--clear-splines-frames\n");
+    return 1;
+  }
+  if (args.NeedsLfGlobalChunk0TailTrim() && !args.NeedsClearSplinesFrames()) {
+    fprintf(stderr,
+            "jxltran: --lf-global-chunk0-tail-trim-bytes requires "
+            "--clear-splines-frames in the same invocation\n");
+    return 1;
+  }
+  if (args.NeedsLfGlobalChunk0TailTrim()) {
+    for (const auto& pr : args.lf_chunk0_tail_trim.pairs) {
+      if (!std::binary_search(args.clear_splines_frames.indices.begin(),
+                              args.clear_splines_frames.indices.end(),
+                              pr.first)) {
+        fprintf(stderr,
+                "jxltran: --lf-global-chunk0-tail-trim-bytes: frame %" PRIuS
+                " must appear in --clear-splines-frames\n",
+                pr.first);
+        return 1;
+      }
+    }
   }
   if ((args.extract_exif && args.set_exif) ||
       (args.extract_xmp && args.set_xmp) ||
@@ -2285,6 +2537,25 @@ int main(int argc, const char* argv[]) {
             "jxltran: --set-exif, --set-xmp, and --set-jumbf require OUTPUT.\n");
     return 1;
   }
+  if (args.check_reversible && !args.file_out) {
+    fprintf(stderr,
+            "jxltran: --check_reversible requires an OUTPUT file argument\n");
+    return 1;
+  }
+  if (args.opsin_inverse && !args.NeedsOpsinAdjust()) {
+    fprintf(stderr,
+            "jxltran: --opsin-inverse requires at least one of --opsin-exposure, "
+            "--opsin-temperature, --opsin-tint, --opsin-hue\n");
+    return 1;
+  }
+
+  if (args.photon_iso.set && args.photon_weights != nullptr) {
+    fprintf(stderr,
+            "jxltran: use only one of --set-photon-noise-iso and "
+            "--set-photon-noise-weights\n");
+    return 1;
+  }
+
   if (!args.info && !args.file_out && !args.extract_icc &&
       !args.extract_splines && !meta_extract) {
     fprintf(stderr, "No output file specified.\n");
@@ -2525,22 +2796,70 @@ int main(int argc, const char* argv[]) {
 
   // ── Codestream transforms (read → mutate ParsedCodestream → write)
   // ───────────
+  jxltran::UndoRecorder undo_rec;
+  std::vector<uint8_t> codestream_before_transform;
+  if (args.file_out) {
+    const bool meta_set_cur = args.set_exif != nullptr ||
+                               args.set_xmp != nullptr ||
+                               args.set_jumbf != nullptr;
+    const bool append_any = args.append_jxl != nullptr || args.append_dummy_tail;
+    if (!jxltran::ArgsBoxPipelineReversibleForUndo(
+            args.strip != 0, args.jxlp != JxlpOpt::kAsIs,
+            args.box_order.order != jxltran::BoxOrder::kAsIs,
+            args.brob.mode != jxltran::BrobOpt::kAsIs, append_any, meta_set_cur)) {
+      undo_rec.SetBoxPipelineNotReversible("strip/jxlp/box-order/brob/append/metadata");
+    }
+    if (args.NeedsClearSplinesFrames() && !args.NeedsLfGlobalChunk0TailTrim()) {
+      undo_rec.SetCodestreamNotReversible(
+          "standalone --clear-splines-frames (undo not emitted)");
+    }
+    if (args.gab_weights != nullptr || args.NeedsSetFrameDurations()) {
+      undo_rec.SetCodestreamNotReversible(
+          "operation not in undo scope (see WIP.md)");
+    }
+  }
+
   const bool needs_codestream_transform =
       args.NeedsHeaderMod() || args.crop.set || args.GabOptionCount() > 0 ||
-      args.NeedsPhotonNoiseIso() || args.NeedsSplinesSet() ||
+      args.NeedsPhotonNoiseAny() || args.NeedsSplinesSet() ||
+      args.NeedsClearSplinesFrames() || args.NeedsLfGlobalChunk0TailTrim() ||
       args.NeedsEpfIters() || args.NeedsEpfAmpScale() ||
       args.NeedsEpfUniformity() ||
       args.group_order != jxltran::TocGroupOrderCli::kKeep ||
       args.NeedsOpsinAdjust() || args.NeedsKeepListedFrames() ||
       args.NeedsSetFrameBlends() || args.NeedsSetFrameDurations() ||
       args.NeedsSetFrameNames() || args.NeedsSetFrameRegions();
+  if (args.file_out && args.check_reversible && !needs_codestream_transform) {
+    if (is_container) {
+      if (!jxltran::ReassembleCodestream(boxes, &codestream_before_transform)) {
+        return 1;
+      }
+    } else {
+      codestream_before_transform = codestream;
+    }
+  }
   if (needs_codestream_transform) {
+    if (args.file_out) {
+      if (is_container) {
+        if (!jxltran::ReassembleCodestream(boxes, &codestream_before_transform)) {
+          return 1;
+        }
+      } else {
+        codestream_before_transform = codestream;
+      }
+    }
     auto transform_codestream = [&](std::vector<uint8_t>* cs) -> bool {
       const uint8_t* orig_bytes = cs->data();
       const size_t orig_size = cs->size();
       jxltran::ParsedCodestream parsed;
       if (!jxltran::ReadCodestream(orig_bytes, orig_size, &parsed)) {
         return false;
+      }
+      if (args.file_out) {
+        undo_rec.CapturePreHeader(parsed);
+        if (args.frames.set) {
+          undo_rec.SetSelectiveFramesCopy(args.frames.indices);
+        }
       }
       if (args.tps.set &&
           !ResolveTpsPercentFromMetadata(parsed.image.metadata, &args.tps)) {
@@ -2573,8 +2892,16 @@ int main(int argc, const char* argv[]) {
         mod.set_tps_denominator = args.tps.denominator;
         if (!jxltran::ApplyHeaderMod(&parsed, mod)) return false;
       }
+      if (args.file_out) {
+        uint32_t orient_after = parsed.image.metadata.orientation;
+        if (orient_after < 1 || orient_after > 8) orient_after = 1;
+        undo_rec.NoteHeaderChanges(
+            args.set_orientation != 0, args.rel_orientation != 0, orient_after,
+            args.set_bits_per_sample != 0, args.num_loops.set, args.tps.set);
+      }
       if (args.NeedsOpsinAdjust()) {
         jxltran::OpsinAdjustParams oa;
+        oa.undo_inverse = args.opsin_inverse;
         if (args.opsin_exposure.set) oa.exposure_ev = args.opsin_exposure.value;
         if (args.opsin_temperature.set) {
           oa.temperature = args.opsin_temperature.value;
@@ -2587,8 +2914,20 @@ int main(int argc, const char* argv[]) {
         }
         if (opsin_changed) wrote_anything = true;
       }
+      if (args.file_out && args.NeedsOpsinAdjust() && !args.opsin_inverse) {
+        undo_rec.NoteOpsinAdjust(
+            args.opsin_exposure.set, args.opsin_temperature.set,
+            args.opsin_tint.set, args.opsin_hue.set, args.opsin_exposure.value,
+            args.opsin_temperature.value, args.opsin_tint.value,
+            args.opsin_hue.value);
+      }
       if (args.set_frame_regions.set) {
         for (const auto& pr : args.set_frame_regions.pairs) {
+          if (args.file_out &&
+              !undo_rec.CaptureFrameRegionBeforeMove(parsed, pr.first,
+                                                     input_orient_for_crop)) {
+            return false;
+          }
           const CropArg& cr = pr.second;
           bool fr_changed = false;
           if (!jxltran::ApplySetFrameRegionFromDisplay(
@@ -2616,6 +2955,10 @@ int main(int argc, const char* argv[]) {
                                crop_h == input_sh_for_crop && crop_x == 0 &&
                                crop_y == 0;
         if (!crop_noop) {
+          if (args.file_out) {
+            undo_rec.NoteCropApplied(input_sw_for_crop, input_sh_for_crop, crop_x,
+                                     crop_y, crop_w, crop_h);
+          }
           if (!jxltran::ApplyCrop(&parsed, crop_x, crop_y, crop_w, crop_h)) {
             return false;
           }
@@ -2625,14 +2968,30 @@ int main(int argc, const char* argv[]) {
       const std::vector<size_t>* frame_sel =
           args.frames.set ? &args.frames.indices : nullptr;
       if (args.GabOptionCount() > 0) {
+        if (args.file_out) {
+          if (args.gab_blur) {
+            undo_rec.NoteGabBlur(gab_args.amount);
+          } else if (args.gab_sharpen) {
+            undo_rec.NoteGabSharpen(gab_args.amount);
+          }
+        }
         if (!jxltran::ApplyGabArgs(&parsed, gab_args, frame_sel)) return false;
         wrote_anything = true;
+      }
+      const bool any_epf = args.NeedsEpfIters() || args.NeedsEpfAmpScale() ||
+                           args.NeedsEpfUniformity();
+      uint32_t epf_mask = 0;
+      if (args.file_out && any_epf) {
+        undo_rec.CaptureRestorationBeforeEpfOps(parsed, frame_sel);
       }
       if (args.NeedsEpfIters()) {
         if (!jxltran::ApplyEpfIters(&parsed, args.epf_iters.iters, frame_sel)) {
           return false;
         }
         wrote_anything = true;
+        if (args.file_out) {
+          epf_mask |= 1u;
+        }
       }
       if (args.NeedsEpfAmpScale()) {
         if (!jxltran::ApplyEpfAmplitudeScale(&parsed, args.epf_amp_scale.factor,
@@ -2641,6 +3000,10 @@ int main(int argc, const char* argv[]) {
         }
         if (args.epf_amp_scale.factor != 1.f) {
           wrote_anything = true;
+          if (args.file_out) {
+            epf_mask |= 2u;
+            undo_rec.NoteEpfAmplitudeScale(args.epf_amp_scale.factor);
+          }
         }
       }
       if (args.NeedsEpfUniformity()) {
@@ -2649,28 +3012,62 @@ int main(int argc, const char* argv[]) {
                                               frame_sel, &epf_u_changed)) {
           return false;
         }
-        if (epf_u_changed) wrote_anything = true;
+        if (epf_u_changed) {
+          wrote_anything = true;
+          if (args.file_out) {
+            epf_mask |= 4u;
+          }
+        }
+      }
+      if (args.file_out && any_epf) {
+        undo_rec.FinalizeEpfRestorationUndo(epf_mask);
       }
       if (args.NeedsSplinesSet()) {
+        jxltran::SplinesApplySummary spline_summary;
         if (!jxltran::ApplySplinesFromFile(&parsed, args.set_splines_from,
-                                           frame_sel)) {
+                                           frame_sel, &spline_summary)) {
           return false;
+        }
+        if (args.file_out) {
+          if (spline_summary.replaced_existing_splines) {
+            undo_rec.SetCodestreamNotReversible(
+                "--set-splines-from replaced existing splines (undo not emitted)");
+          } else if (!spline_summary.added_on_spline_free.empty()) {
+            undo_rec.NoteSplinesAddedOnFrames(spline_summary.added_on_spline_free);
+          }
         }
         wrote_anything = true;
       }
-      if (args.NeedsPhotonNoiseIso()) {
-        if (!jxltran::ApplyPhotonNoiseIso(&parsed, true, args.photon_iso.iso,
-                                          frame_sel)) {
-          return false;
+      if (args.NeedsPhotonNoiseAny()) {
+        if (args.file_out) {
+          undo_rec.CapturePhotonNoiseBeforeApply(parsed, frame_sel);
+        }
+        bool ok = true;
+        if (args.NeedsPhotonNoiseIso()) {
+          ok = jxltran::ApplyPhotonNoiseIso(&parsed, true, args.photon_iso.iso,
+                                            frame_sel);
+        } else {
+          ok = jxltran::ApplyPhotonNoiseWeights(&parsed, true, args.photon_weights,
+                                                frame_sel);
+        }
+        if (!ok) return false;
+        if (args.file_out) {
+          undo_rec.FinalizePhotonNoiseAfterApply(parsed);
         }
         wrote_anything = true;
       }
       if (args.group_order != jxltran::TocGroupOrderCli::kKeep) {
+        if (args.file_out) {
+          undo_rec.CaptureTocBeforeGroupOrder(parsed, frame_sel);
+        }
         bool toc_changed = false;
         if (!jxltran::ApplyTocGroupOrder(&parsed, args.group_order, args.center_x,
                                         args.center_y, frame_sel,
                                         &toc_changed)) {
           return false;
+        }
+        if (args.file_out) {
+          undo_rec.FinalizeTocGroupOrderAfterApply(toc_changed);
         }
         if (toc_changed) wrote_anything = true;
       }
@@ -2683,9 +3080,19 @@ int main(int argc, const char* argv[]) {
       if (keep_and_blends) {
         const size_t n_before_keep = parsed.frames.size();
         bool keep_changed = false;
-        if (!jxltran::ApplyKeepListedFrames(&parsed, keep_order_sel,
-                                             &keep_changed)) {
+        jxltran::KeepReorderUndoSpec keep_undo;
+        if (!jxltran::ApplyKeepListedFrames(
+                &parsed, keep_order_sel, &keep_changed,
+                args.file_out ? &keep_undo : nullptr)) {
           return false;
+        }
+        if (args.file_out && !keep_undo.forward_order.empty()) {
+          undo_rec.NoteKeepReorder(std::move(keep_undo));
+        } else if (args.file_out && args.keep_listed_frames && keep_changed &&
+                   keep_undo.forward_order.empty()) {
+          undo_rec.SetCodestreamNotReversible(
+              "--keep-listed-frames: --check_reversible only supports a full "
+              "reorder (each codestream frame index kept exactly once)");
         }
         if (keep_changed) wrote_anything = true;
         std::vector<jxltran::FrameBlendOverride> blend_ov =
@@ -2694,6 +3101,9 @@ int main(int argc, const char* argv[]) {
                 keep_order_sel, n_before_keep, &blend_ov)) {
           return false;
         }
+        if (args.file_out) {
+          undo_rec.NoteFrameBlendBeforeOverrides(parsed, blend_ov);
+        }
         if (!jxltran::ApplyFrameBlendOverrides(&parsed, blend_ov)) {
           return false;
         }
@@ -2701,9 +3111,29 @@ int main(int argc, const char* argv[]) {
         did_early_keep_for_blends = true;
       }
       if (args.NeedsSetFrameBlends() && !did_early_keep_for_blends) {
+        if (args.file_out) {
+          undo_rec.NoteFrameBlendBeforeOverrides(
+              parsed, args.set_frame_blends.overrides);
+        }
         if (!jxltran::ApplyFrameBlendOverrides(&parsed,
                                               args.set_frame_blends.overrides)) {
           return false;
+        }
+        wrote_anything = true;
+      }
+      if (args.NeedsClearSplinesFrames()) {
+        if (!jxltran::ApplyClearSplinesOnFrames(
+                &parsed, args.clear_splines_frames.indices)) {
+          return false;
+        }
+        wrote_anything = true;
+      }
+      if (args.NeedsLfGlobalChunk0TailTrim()) {
+        for (const auto& pr : args.lf_chunk0_tail_trim.pairs) {
+          if (!jxltran::ApplyLfGlobalPhysicalChunk0TailTrim(&parsed, pr.first,
+                                                            pr.second)) {
+            return false;
+          }
         }
         wrote_anything = true;
       }
@@ -2716,13 +3146,27 @@ int main(int argc, const char* argv[]) {
       }
       if (args.NeedsKeepListedFrames() && !did_early_keep_for_blends) {
         bool keep_changed = false;
-        if (!jxltran::ApplyKeepListedFrames(&parsed, keep_order_sel,
-                                            &keep_changed)) {
+        jxltran::KeepReorderUndoSpec keep_undo;
+        if (!jxltran::ApplyKeepListedFrames(&parsed, keep_order_sel, &keep_changed,
+                                            args.file_out ? &keep_undo : nullptr)) {
           return false;
+        }
+        if (args.file_out && !keep_undo.forward_order.empty()) {
+          undo_rec.NoteKeepReorder(std::move(keep_undo));
+        } else if (args.file_out && args.keep_listed_frames && keep_changed &&
+                   keep_undo.forward_order.empty()) {
+          undo_rec.SetCodestreamNotReversible(
+              "--keep-listed-frames: --check_reversible only supports a full "
+              "reorder (each codestream frame index kept exactly once)");
         }
         if (keep_changed) wrote_anything = true;
       }
       if (args.NeedsSetFrameNames()) {
+        if (args.file_out) {
+          for (const auto& pr : args.set_frame_names.pairs) {
+            undo_rec.NoteFrameNameBeforeChange(parsed, pr.first);
+          }
+        }
         if (!jxltran::ApplySetFrameNames(&parsed, args.set_frame_names.pairs)) {
           return false;
         }
@@ -2733,6 +3177,10 @@ int main(int argc, const char* argv[]) {
       }
       std::vector<uint8_t> out;
       if (!jxltran::WriteCodestream(parsed, orig_bytes, &out)) return false;
+      if (args.file_out) {
+        undo_rec.FinalizeSplineLfGlobalChunk0TailTrim(orig_bytes, orig_size,
+                                                      out.data(), out.size());
+      }
       *cs = std::move(out);
       return true;
     };
@@ -2748,6 +3196,9 @@ int main(int argc, const char* argv[]) {
       replace_codestream_boxes(std::move(cs));
     } else {
       if (!transform_codestream(&codestream)) return 1;
+    }
+    if (args.file_out) {
+      undo_rec.FinalizePipelineCompatibility();
     }
   }
 
@@ -2803,5 +3254,43 @@ int main(int argc, const char* argv[]) {
   }
 
   if (!WriteFile(args.file_out, output)) return 1;
+
+  if (args.file_out) {
+    std::string undo_line;
+    if (undo_rec.BuildUndoCommandLine(argv[0], args.file_out,
+                                      "INPUT_RESTORED.jxl", &undo_line)) {
+      PrintReversibleUndoLine(undo_line);
+    }
+    if (args.check_reversible) {
+      if (!undo_rec.box_pipeline_reversible() ||
+          !undo_rec.codestream_undo_supported()) {
+        printf("reversible_check: not_reversible\n");
+      } else {
+        std::vector<uint8_t> out_cs;
+        const bool out_cont =
+            jxltran::IsJxlContainer(output.data(), output.size());
+        if (out_cont) {
+          std::vector<jxltran::JxlBox> out_boxes;
+          if (!jxltran::ParseBoxes(output.data(), output.size(), &out_boxes)) {
+            return 1;
+          }
+          if (!jxltran::ReassembleCodestream(out_boxes, &out_cs)) return 1;
+        } else {
+          out_cs = output;
+        }
+        const jxltran::ReversibleCheckStatus st =
+            undo_rec.VerifyRoundtripCodestream(codestream_before_transform,
+                                               out_cs);
+        if (st == jxltran::ReversibleCheckStatus::kOk) {
+          printf("reversible_check: ok\n");
+        } else if (st ==
+                   jxltran::ReversibleCheckStatus::kNotReversibleSkipped) {
+          printf("reversible_check: not_reversible\n");
+        } else {
+          printf("reversible_check: mismatch\n");
+        }
+      }
+    }
+  }
   return 0;
 }

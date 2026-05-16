@@ -425,6 +425,8 @@ bool ReadLfGlobalThroughNoise(
     if (!ReadNoiseLut80(br, &noise_bytes)) {
       return false;
     }
+    out->noise_lut_bytes_valid = true;
+    out->noise_lut_bytes = noise_bytes;
     std::array<float, kNoiseLutPoints> lut{};
     if (!DecodeNoiseLutBits(noise_bytes, &lut)) {
       return false;

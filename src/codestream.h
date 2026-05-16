@@ -81,6 +81,10 @@ struct FramedUnit {
   // Offset in bits from the start of the LF-global TOC section to the first bit
   // of the 80-bit LUT (or insert point when adding noise). Set with abs_valid.
   size_t lf_global_noise_lut_rel_bit = 0;
+  // Verbatim 80-bit LUT read at ReadCodestream time when kFrameFlagNoise (for
+  // lossless undo / --set-photon-noise-weights round-trips).
+  bool lf_global_noise_raw_valid = false;
+  std::array<uint8_t, 10> lf_global_noise_raw_bytes{};
   // LF-global spline entropy region (bit indices; end exclusive). Valid after
   // a successful LF-global prefix parse: if kFrameFlagSplines and splines were
   // decoded, this spans the existing bundle; if the splines flag was clear,
@@ -128,6 +132,12 @@ bool ReadCodestream(const uint8_t* data, size_t size, ParsedCodestream* out);
 // ranges are copied verbatim relative to per-frame offsets).
 bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
                      std::vector<uint8_t>* out);
+
+// Decodes |fu|'s frame body into stream-order TOC chunks (sizes from
+// |fu.toc_decoded_sizes|) using |original| as the codestream byte source.
+bool ExtractFramedUnitBodyStreamChunks(const uint8_t* original, size_t orig_size,
+                                       const FramedUnit& fu,
+                                       std::vector<std::vector<uint8_t>>* chunks_out);
 
 }  // namespace jxltran
 

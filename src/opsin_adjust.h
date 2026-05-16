@@ -25,6 +25,11 @@ struct OpsinAdjustParams {
   float tint = 0.f;
   // Hue rotation in the R–B output plane, roughly −100..100 (±~5° at extremes).
   float hue = 0.f;
+  // When false (default): left-multiply M by 2^ev · R(h) · D_tint(u) · D_temp(t)
+  // (same order as libjxl-style sliders). When true: left-multiply by the exact
+  // inverse of that transform using the same ev/temperature/tint/hue magnitudes
+  // (used by --check_reversible undo; temperature/tint are not inverted by sign).
+  bool undo_inverse = false;
 };
 
 // Returns false if the image is not XYB-encoded or parameters are invalid.

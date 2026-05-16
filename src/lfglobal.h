@@ -62,6 +62,9 @@ struct LfGlobalThroughNoise {
   // 8×10-bit noise LUT begins (or would begin if kNoise were set).
   size_t noise_lut_start_bit = 0;
   std::optional<LfGlobalSplines> splines;
+  // When kFrameFlagNoise, the verbatim 80-bit LUT read from the bitstream.
+  bool noise_lut_bytes_valid = false;
+  std::array<uint8_t, 10> noise_lut_bytes{};
 };
 
 bool DecodeSplinesBundle(BitReader& br, size_t num_pixels,

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -738,6 +739,17 @@ bool ApplyEpfSharpUniformity(ParsedCodestream* cs, float uniformity,
   return true;
 }
 
+bool ApplyRestorationFilterExactRestore(ParsedCodestream* cs, size_t frame_index,
+                                        const ParsedRestorationFilter& rf) {
+  if (frame_index >= cs->frames.size()) return false;
+  FramedUnit& fu = cs->frames[frame_index];
+  const uint32_t ft = fu.frame.frame_type;
+  if (ft == kFrameTypeLF || ft == kFrameTypeReferenceOnly) return false;
+  fu.frame.restoration = rf;
+  fu.frame.rf_reencode = true;
+  return true;
+}
+
 float EpfSharpUniformityForInfo(bool restoration_all_default,
                                 const ParsedRestorationFilter& rf) {
   ParsedRestorationFilter eff = rf;
@@ -798,6 +810,252 @@ static bool LfGlobalSection0BitLength(const FramedUnit& fu, size_t* bits) {
   return true;
 }
 
+// Bit length of LF-global physical chunk0 after a spline splice — must match
+// WriteCodestream's |c0_payload_bits| (simple TOC path, no permutation).
+static bool SplineEditLfChunk0SplicePayloadBits(const FramedUnit& fu,
+                                               size_t* payload_bits_out) {
+  const size_t frame_bit_base = fu.original_frame_byte_offset * 8;
+  const size_t a0 = frame_bit_base + fu.toc_start_bit + fu.toc_bit_length;
+  const int64_t delta_bits = fu.spline_edit_delta_bits;
+  if (delta_bits % 8 != 0) {
+    return false;
+  }
+  const int64_t photon_bits =
+      fu.photon_noise_edit
+          ? static_cast<int64_t>(fu.photon_noise_delta_bytes) * 8
+          : 0;
+  const size_t old_body_bits = static_cast<size_t>(
+      static_cast<int64_t>(fu.body_bit_length) - delta_bits - photon_bits);
+  const size_t body_end_orig = a0 + old_body_bits;
+  const size_t s0 = fu.lf_global_spline_region_abs_start_bit;
+  const size_t s1 = fu.lf_global_spline_region_abs_end_bit;
+  if (s0 < a0 || s1 < s0 || s1 > body_end_orig) {
+    return false;
+  }
+  size_t p0 = 0;
+  if (!PhysicalStreamIndexForLogical0(fu, &p0) || p0 >= fu.toc_decoded_sizes.size()) {
+    return false;
+  }
+  const int64_t dbytes = delta_bits / 8;
+  const int64_t photon_db =
+      fu.photon_noise_edit ? static_cast<int64_t>(fu.photon_noise_delta_bytes) : 0;
+  const int64_t new_c0_bytes = static_cast<int64_t>(fu.toc_decoded_sizes[p0]);
+  const int64_t old_c0_bytes_i = new_c0_bytes - dbytes - photon_db;
+  if (old_c0_bytes_i < 0 ||
+      old_c0_bytes_i > static_cast<int64_t>(UINT32_MAX)) {
+    return false;
+  }
+  const size_t chunk0_end_abs =
+      a0 + static_cast<size_t>(static_cast<uint32_t>(old_c0_bytes_i)) * 8u;
+  if (s1 > chunk0_end_abs) {
+    return false;
+  }
+  *payload_bits_out =
+      (s0 - a0) + fu.spline_edit_new_mid_bits + (chunk0_end_abs - s1);
+  return true;
+}
+
+// If TOC chunk0 is smaller than the splice payload, grow delta / TOC / body in
+// lockstep (whole bytes) so WriteCodestream will not fail with
+// "new LF-global section too small". Only for the non-permuted TOC spline path.
+static bool EnsureSplineEditLfChunk0Budget(FramedUnit* fu) {
+  if (fu->toc_perm.empty() == false) {
+    return true;
+  }
+  size_t payload = 0;
+  if (!SplineEditLfChunk0SplicePayloadBits(*fu, &payload)) {
+    return false;
+  }
+  size_t budget = 0;
+  if (!LfGlobalSection0BitLength(*fu, &budget)) {
+    return true;
+  }
+  if (budget >= payload) {
+    return true;
+  }
+  const size_t deficit = payload - budget;
+  const int64_t add_bits = static_cast<int64_t>(((deficit + 7u) / 8u) * 8u);
+  fu->spline_edit_delta_bits += add_bits;
+  fu->body_bit_length = static_cast<size_t>(
+      static_cast<int64_t>(fu->body_bit_length) + add_bits);
+  size_t p0 = 0;
+  if (!PhysicalStreamIndexForLogical0(*fu, &p0)) {
+    return false;
+  }
+  const int64_t nb =
+      static_cast<int64_t>(fu->toc_decoded_sizes[p0]) + add_bits / 8;
+  if (nb < 0 || nb > static_cast<int64_t>(UINT32_MAX)) {
+    return false;
+  }
+  fu->toc_decoded_sizes[p0] = static_cast<uint32_t>(nb);
+  return true;
+}
+
+enum class PhotonNoiseFrameOp { kRemove, kReplaceBytes, kInsertBytes };
+
+// |insert_allow_empty_lut|: when true, skips NoiseLutHasAny before insert (lossless
+// undo restoring verbatim prior bytes).
+static bool PhotonNoiseApplyToFrame(ParsedCodestream* cs, size_t fi,
+                                    PhotonNoiseFrameOp op,
+                                    const std::array<uint8_t, 10>& bytes,
+                                    bool insert_allow_empty_lut) {
+  FramedUnit& fu = cs->frames[fi];
+  fu.photon_noise_edit = false;
+  fu.photon_noise_delta_bytes = 0;
+  fu.photon_noise_patch_abs_bit = 0;
+  fu.photon_noise_new_bytes.fill(0);
+  fu.photon_noise_toc_reencode = false;
+
+  FrameHeader* fh = &fu.frame;
+  const uint32_t canvas_w = cs->image.size.width;
+  const uint32_t canvas_h = cs->image.size.height;
+  const uint32_t ft = fh->frame_type;
+  if (ft == kFrameTypeLF || ft == kFrameTypeReferenceOnly) {
+    return true;
+  }
+  if (ft != kFrameTypeRegular && ft != kFrameTypeSkipProgressive) {
+    return true;
+  }
+
+  size_t sec0_bytes = 0;
+  if (!LogicalSection0BodyByteOffset(fu, &sec0_bytes)) {
+    fprintf(stderr, "jxltran: photon noise: invalid TOC permutation\n");
+    return false;
+  }
+
+  const size_t xsize_px = fh->have_crop ? fh->crop_width : canvas_w;
+  const size_t ysize_px = fh->have_crop ? fh->crop_height : canvas_h;
+  if (xsize_px == 0 || ysize_px == 0) {
+    fprintf(stderr, "jxltran: photon noise: invalid frame dimensions\n");
+    return false;
+  }
+
+  const size_t frame_bit0 = fu.original_frame_byte_offset * 8;
+  const size_t body0 = frame_bit0 + fu.toc_start_bit + fu.toc_bit_length;
+
+  size_t patch_abs = body0 + sec0_bytes * 8;
+  if (fu.lf_global_noise_lut_abs_valid) {
+    patch_abs = fu.lf_global_noise_lut_abs_bit;
+  } else if ((fh->flags & kFrameFlagPatches) != 0 ||
+             (fh->flags & kFrameFlagSplines) != 0) {
+    fprintf(stderr,
+            "jxltran: photon noise: could not parse DC-global prefix "
+            "(patches/splines); noise LUT position is unknown.\n");
+    return false;
+  }
+
+  const bool had_noise = (fh->flags & kFrameFlagNoise) != 0;
+
+  size_t s0_bits = 0;
+  if (!LfGlobalSection0BitLength(fu, &s0_bits)) {
+    fprintf(stderr, "jxltran: photon noise: missing TOC sizes for DC global\n");
+    return false;
+  }
+  const size_t noise_rel =
+      fu.lf_global_noise_lut_abs_valid ? fu.lf_global_noise_lut_rel_bit : 0;
+
+  if (op == PhotonNoiseFrameOp::kRemove) {
+    if (!had_noise) {
+      return true;
+    }
+    if (noise_rel + 80 > s0_bits) {
+      fprintf(stderr,
+              "jxltran: photon noise: noise LUT extends past DC-global section\n");
+      return false;
+    }
+    fh->flags &= ~kFrameFlagNoise;
+    fh->all_default = false;
+    fu.photon_noise_edit = true;
+    fu.photon_noise_delta_bytes = -10;
+    fu.photon_noise_patch_abs_bit = patch_abs;
+    fu.photon_noise_toc_reencode = true;
+    if (!fu.toc_decoded_sizes.empty()) {
+      size_t p0 = 0;
+      if (!PhysicalStreamIndexForLogical0(fu, &p0)) {
+        fprintf(stderr, "jxltran: photon noise: invalid TOC permutation\n");
+        return false;
+      }
+      const uint32_t s0 = fu.toc_decoded_sizes[p0];
+      if (s0 < 10u) {
+        fprintf(stderr,
+                "jxltran: photon noise: DC global section too small to remove "
+                "noise\n");
+        return false;
+      }
+      fu.toc_decoded_sizes[p0] = s0 - 10u;
+    }
+    fu.body_bit_length -= 80;
+    return true;
+  }
+
+  std::array<float, kNoiseLutPoints> dec{};
+  if (!DecodeNoiseLutBits(bytes, &dec)) {
+    fprintf(stderr, "jxltran: photon noise: invalid 80-bit LUT encoding\n");
+    return false;
+  }
+  if (op == PhotonNoiseFrameOp::kInsertBytes) {
+    if (!insert_allow_empty_lut && !NoiseLutHasAny(dec)) {
+      return true;
+    }
+  } else if (op == PhotonNoiseFrameOp::kReplaceBytes) {
+    if (!NoiseLutHasAny(dec)) {
+      return PhotonNoiseApplyToFrame(cs, fi, PhotonNoiseFrameOp::kRemove, bytes,
+                                     false);
+    }
+  }
+
+  fu.photon_noise_new_bytes = bytes;
+
+  if (op == PhotonNoiseFrameOp::kReplaceBytes) {
+    if (!had_noise) {
+      fprintf(stderr,
+              "jxltran: photon noise: internal error (replace without prior noise)\n");
+      return false;
+    }
+    if (noise_rel + 80 > s0_bits) {
+      fprintf(stderr,
+              "jxltran: photon noise: noise LUT extends past DC-global section\n");
+      return false;
+    }
+    fh->flags |= kFrameFlagNoise;
+    fh->all_default = false;
+    fu.photon_noise_edit = true;
+    fu.photon_noise_delta_bytes = 0;
+    fu.photon_noise_patch_abs_bit = patch_abs;
+    fu.photon_noise_toc_reencode = false;
+    return true;
+  }
+
+  // kInsertBytes
+  if (had_noise) {
+    fprintf(stderr,
+            "jxltran: photon noise: internal error (insert while noise flag set)\n");
+    return false;
+  }
+  if (noise_rel > s0_bits) {
+    fprintf(stderr,
+            "jxltran: photon noise: noise insert point past DC-global section\n");
+    return false;
+  }
+
+  fh->flags |= kFrameFlagNoise;
+  fh->all_default = false;
+  fu.photon_noise_edit = true;
+  fu.photon_noise_delta_bytes = 10;
+  fu.photon_noise_patch_abs_bit = patch_abs;
+  fu.photon_noise_toc_reencode = true;
+  if (!fu.toc_decoded_sizes.empty()) {
+    size_t p0 = 0;
+    if (!PhysicalStreamIndexForLogical0(fu, &p0)) {
+      fprintf(stderr, "jxltran: photon noise: invalid TOC permutation\n");
+      return false;
+    }
+    fu.toc_decoded_sizes[p0] += 10u;
+  }
+  fu.body_bit_length += 80;
+  return true;
+}
+
 }  // namespace
 
 bool ApplyPhotonNoiseIso(ParsedCodestream* cs, bool change, float iso,
@@ -815,19 +1073,6 @@ bool ApplyPhotonNoiseIso(ParsedCodestream* cs, bool change, float iso,
   for (size_t fi = 0; fi < cs->frames.size(); ++fi) {
     if (!want_frame(fi)) continue;
     FramedUnit& fu = cs->frames[fi];
-    if (fu.spline_edit) {
-      fprintf(stderr,
-              "jxltran: --set-photon-noise-iso cannot be combined with "
-              "--set-splines-from on the same output pass (frame %" PRIuS ").\n",
-              fi);
-      return false;
-    }
-    fu.photon_noise_edit = false;
-    fu.photon_noise_delta_bytes = 0;
-    fu.photon_noise_patch_abs_bit = 0;
-    fu.photon_noise_new_bytes.fill(0);
-    fu.photon_noise_toc_reencode = false;
-
     FrameHeader* fh = &fu.frame;
     const uint32_t ft = fh->frame_type;
     if (ft == kFrameTypeLF || ft == kFrameTypeReferenceOnly) {
@@ -850,139 +1095,192 @@ bool ApplyPhotonNoiseIso(ParsedCodestream* cs, bool change, float iso,
       return false;
     }
 
-    const size_t frame_bit0 = fu.original_frame_byte_offset * 8;
-    const size_t body0 = frame_bit0 + fu.toc_start_bit + fu.toc_bit_length;
-    const size_t lf_global_abs = body0 + sec0_bytes * 8;
-
-    size_t patch_abs = lf_global_abs;
-    if (fu.lf_global_noise_lut_abs_valid) {
-      patch_abs = fu.lf_global_noise_lut_abs_bit;
-    } else if ((fh->flags & kFrameFlagPatches) != 0 ||
-               (fh->flags & kFrameFlagSplines) != 0) {
-      fprintf(stderr,
-              "jxltran: --set-photon-noise-iso: could not parse DC-global prefix "
-              "(patches/splines); noise LUT position is unknown.\n");
-      return false;
-    }
-
-    const bool had_noise = (fh->flags & kFrameFlagNoise) != 0;
-
-    size_t s0_bits = 0;
-    if (!LfGlobalSection0BitLength(fu, &s0_bits)) {
-      fprintf(stderr, "jxltran: photon noise: missing TOC sizes for DC global\n");
-      return false;
-    }
-    const size_t noise_rel =
-        fu.lf_global_noise_lut_abs_valid ? fu.lf_global_noise_lut_rel_bit : 0;
-
     if (iso <= 0.f) {
-      if (!had_noise) {
-        continue;
-      }
-      if (noise_rel + 80 > s0_bits) {
-        fprintf(stderr,
-                "jxltran: photon noise: noise LUT extends past DC-global section\n");
+      if (!PhotonNoiseApplyToFrame(cs, fi, PhotonNoiseFrameOp::kRemove,
+                                   fu.photon_noise_new_bytes, false)) {
         return false;
       }
-      fh->flags &= ~kFrameFlagNoise;
-      fh->all_default = false;
-      fu.photon_noise_edit = true;
-      fu.photon_noise_delta_bytes = -10;
-      fu.photon_noise_patch_abs_bit = patch_abs;
-      fu.photon_noise_toc_reencode = true;
-      if (!fu.toc_decoded_sizes.empty()) {
-        size_t p0 = 0;
-        if (!PhysicalStreamIndexForLogical0(fu, &p0)) {
-          fprintf(stderr, "jxltran: photon noise: invalid TOC permutation\n");
-          return false;
-        }
-        const uint32_t s0 = fu.toc_decoded_sizes[p0];
-        if (s0 < 10u) {
-          fprintf(stderr,
-                  "jxltran: photon noise: DC global section too small to remove "
-                  "noise\n");
-          return false;
-        }
-        fu.toc_decoded_sizes[p0] = s0 - 10u;
-      }
-      fu.body_bit_length -= 80;
       continue;
     }
 
     std::array<float, kNoiseLutPoints> lut{};
     SimulatePhotonNoise(xsize_px, ysize_px, iso, &lut);
     if (!NoiseLutHasAny(lut)) {
-      if (!had_noise) {
-        continue;
-      }
-      if (noise_rel + 80 > s0_bits) {
-        fprintf(stderr,
-                "jxltran: photon noise: noise LUT extends past DC-global section\n");
+      if (!PhotonNoiseApplyToFrame(cs, fi, PhotonNoiseFrameOp::kRemove,
+                                   fu.photon_noise_new_bytes, false)) {
         return false;
       }
-      fh->flags &= ~kFrameFlagNoise;
-      fh->all_default = false;
-      fu.photon_noise_edit = true;
-      fu.photon_noise_delta_bytes = -10;
-      fu.photon_noise_patch_abs_bit = patch_abs;
-      fu.photon_noise_toc_reencode = true;
-      if (!fu.toc_decoded_sizes.empty()) {
-        size_t p0 = 0;
-        if (!PhysicalStreamIndexForLogical0(fu, &p0)) {
-          fprintf(stderr, "jxltran: photon noise: invalid TOC permutation\n");
-          return false;
-        }
-        const uint32_t s0 = fu.toc_decoded_sizes[p0];
-        if (s0 < 10u) {
-          fprintf(stderr,
-                  "jxltran: photon noise: DC global section too small to remove "
-                  "noise\n");
-          return false;
-        }
-        fu.toc_decoded_sizes[p0] = s0 - 10u;
-      }
-      fu.body_bit_length -= 80;
       continue;
     }
 
-    EncodeNoiseLutBits(lut, &fu.photon_noise_new_bytes);
-
+    std::array<uint8_t, 10> enc{};
+    EncodeNoiseLutBits(lut, &enc);
+    const bool had_noise = (fh->flags & kFrameFlagNoise) != 0;
     if (had_noise) {
-      if (noise_rel + 80 > s0_bits) {
-        fprintf(stderr,
-                "jxltran: photon noise: noise LUT extends past DC-global section\n");
+      if (!PhotonNoiseApplyToFrame(cs, fi, PhotonNoiseFrameOp::kReplaceBytes, enc,
+                                   false)) {
         return false;
       }
-      fh->flags |= kFrameFlagNoise;
-      fh->all_default = false;
-      fu.photon_noise_edit = true;
-      fu.photon_noise_delta_bytes = 0;
-      fu.photon_noise_patch_abs_bit = patch_abs;
-      fu.photon_noise_toc_reencode = false;
-      continue;
+    } else {
+      if (!PhotonNoiseApplyToFrame(cs, fi, PhotonNoiseFrameOp::kInsertBytes, enc,
+                                   false)) {
+        return false;
+      }
     }
+  }
 
-    if (noise_rel > s0_bits) {
+  return true;
+}
+
+bool ApplyPhotonNoiseUndo(ParsedCodestream* cs, const PhotonNoiseUndoSpec& spec) {
+  if (spec.frame_index >= cs->frames.size()) return false;
+  switch (spec.forward_kind) {
+    case PhotonNoiseForwardKind::kInsert: {
+      std::array<uint8_t, 10> dummy{};
+      return PhotonNoiseApplyToFrame(cs, spec.frame_index,
+                                     PhotonNoiseFrameOp::kRemove, dummy, false);
+    }
+    case PhotonNoiseForwardKind::kRemove:
+      return PhotonNoiseApplyToFrame(cs, spec.frame_index,
+                                     PhotonNoiseFrameOp::kInsertBytes,
+                                     spec.prior_bytes, true);
+    case PhotonNoiseForwardKind::kReplace:
+      return PhotonNoiseApplyToFrame(cs, spec.frame_index,
+                                     PhotonNoiseFrameOp::kReplaceBytes,
+                                     spec.prior_bytes, false);
+    default:
+      return false;
+  }
+}
+
+static bool PhotonWeightsSpecIsHex20(const char* s) {
+  if (s == nullptr) return false;
+  size_t n = 0;
+  for (const char* p = s; *p; ++p) {
+    if (*p == ' ' || *p == '\t') continue;
+    ++n;
+  }
+  if (n != 20) return false;
+  for (const char* p = s; *p; ++p) {
+    if (*p == ' ' || *p == '\t') continue;
+    if (!std::isxdigit(static_cast<unsigned char>(*p))) return false;
+  }
+  return true;
+}
+
+static bool ParsePhotonWeightsHex20(const char* s,
+                                    std::array<uint8_t, 10>* out) {
+  int nibble = -1;
+  size_t j = 0;
+  for (const char* p = s; *p; ++p) {
+    if (*p == ' ' || *p == '\t') continue;
+    int v = -1;
+    if (*p >= '0' && *p <= '9') v = *p - '0';
+    else if (*p >= 'a' && *p <= 'f') v = 10 + (*p - 'a');
+    else if (*p >= 'A' && *p <= 'F') v = 10 + (*p - 'A');
+    else return false;
+    if (nibble < 0) {
+      nibble = v;
+    } else {
+      if (j >= 10) return false;
+      (*out)[j++] = static_cast<uint8_t>((nibble << 4) | v);
+      nibble = -1;
+    }
+  }
+  if (nibble >= 0) return false;
+  return j == 10;
+}
+
+bool ApplyPhotonNoiseWeights(ParsedCodestream* cs, bool change,
+                             const char* weights_spec,
+                             const std::vector<size_t>* only_frames) {
+  if (!change) return true;
+  if (weights_spec == nullptr || weights_spec[0] == '\0') {
+    fprintf(stderr, "jxltran: --set-photon-noise-weights: empty value\n");
+    return false;
+  }
+
+  std::array<uint8_t, 10> enc{};
+  if (PhotonWeightsSpecIsHex20(weights_spec)) {
+    if (!ParsePhotonWeightsHex20(weights_spec, &enc)) {
       fprintf(stderr,
-              "jxltran: photon noise: noise insert point past DC-global section\n");
+              "jxltran: --set-photon-noise-weights: invalid 20-hex-digit payload "
+              "'%s'\n",
+              weights_spec);
       return false;
     }
+  } else {
+    std::array<float, kNoiseLutPoints> lut{};
+    const int n = std::sscanf(
+        weights_spec, "%f,%f,%f,%f,%f,%f,%f,%f", &lut[0], &lut[1], &lut[2],
+        &lut[3], &lut[4], &lut[5], &lut[6], &lut[7]);
+    if (n != 8) {
+      fprintf(stderr,
+              "jxltran: --set-photon-noise-weights expects eight comma-separated "
+              "floats or 20 hex digits (verbatim 10-byte LUT), got '%s'\n",
+              weights_spec);
+      return false;
+    }
+    if (!NoiseLutHasAny(lut)) {
+      const auto want_frame = [&](size_t idx) -> bool {
+        if (only_frames == nullptr || only_frames->empty()) return true;
+        return std::binary_search(only_frames->begin(), only_frames->end(),
+                                  idx);
+      };
+      for (size_t fi = 0; fi < cs->frames.size(); ++fi) {
+        if (!want_frame(fi)) continue;
+        const FrameHeader& fh = cs->frames[fi].frame;
+        const uint32_t ft = fh.frame_type;
+        if (ft == kFrameTypeLF || ft == kFrameTypeReferenceOnly) continue;
+        if (ft != kFrameTypeRegular && ft != kFrameTypeSkipProgressive) continue;
+        if ((fh.flags & kFrameFlagNoise) == 0) continue;
+        if (!PhotonNoiseApplyToFrame(cs, fi, PhotonNoiseFrameOp::kRemove, enc,
+                                     false)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    EncodeNoiseLutBits(lut, &enc);
+  }
 
-    fh->flags |= kFrameFlagNoise;
-    fh->all_default = false;
-    fu.photon_noise_edit = true;
-    fu.photon_noise_delta_bytes = 10;
-    fu.photon_noise_patch_abs_bit = patch_abs;
-    fu.photon_noise_toc_reencode = true;
-    if (!fu.toc_decoded_sizes.empty()) {
-      size_t p0 = 0;
-      if (!PhysicalStreamIndexForLogical0(fu, &p0)) {
-        fprintf(stderr, "jxltran: photon noise: invalid TOC permutation\n");
+  const auto want_frame = [&](size_t idx) -> bool {
+    if (only_frames == nullptr || only_frames->empty()) return true;
+    return std::binary_search(only_frames->begin(), only_frames->end(), idx);
+  };
+
+  for (size_t fi = 0; fi < cs->frames.size(); ++fi) {
+    if (!want_frame(fi)) continue;
+    const FrameHeader& fh = cs->frames[fi].frame;
+    const uint32_t ft = fh.frame_type;
+    if (ft == kFrameTypeLF || ft == kFrameTypeReferenceOnly) continue;
+    if (ft != kFrameTypeRegular && ft != kFrameTypeSkipProgressive) continue;
+
+    std::array<float, kNoiseLutPoints> dec{};
+    if (!DecodeNoiseLutBits(enc, &dec)) {
+      fprintf(stderr,
+              "jxltran: --set-photon-noise-weights: invalid LUT encoding\n");
+      return false;
+    }
+    const bool had_noise = (fh.flags & kFrameFlagNoise) != 0;
+    if (!NoiseLutHasAny(dec)) {
+      if (!PhotonNoiseApplyToFrame(cs, fi, PhotonNoiseFrameOp::kRemove, enc,
+                                   false)) {
         return false;
       }
-      fu.toc_decoded_sizes[p0] += 10u;
+      continue;
     }
-    fu.body_bit_length += 80;
+    if (had_noise) {
+      if (!PhotonNoiseApplyToFrame(cs, fi, PhotonNoiseFrameOp::kReplaceBytes, enc,
+                                   false)) {
+        return false;
+      }
+    } else {
+      if (!PhotonNoiseApplyToFrame(cs, fi, PhotonNoiseFrameOp::kInsertBytes, enc,
+                                   false)) {
+        return false;
+      }
+    }
   }
 
   return true;
@@ -1019,7 +1317,12 @@ static bool ReadPathToString(const char* path, std::string* out) {
 }
 
 bool ApplySplinesFromFile(ParsedCodestream* cs, const char* path,
-                          const std::vector<size_t>* only_frames) {
+                          const std::vector<size_t>* only_frames,
+                          SplinesApplySummary* summary) {
+  if (summary != nullptr) {
+    summary->added_on_spline_free.clear();
+    summary->replaced_existing_splines = false;
+  }
   std::string text;
   if (!ReadPathToString(path, &text)) {
     return false;
@@ -1048,13 +1351,6 @@ bool ApplySplinesFromFile(ParsedCodestream* cs, const char* path,
       return false;
     }
     FramedUnit& fu = cs->frames[fi];
-    if (fu.photon_noise_edit) {
-      fprintf(stderr,
-              "jxltran: --set-splines-from cannot be combined with photon noise "
-              "edit on the same pass (frame %" PRIuS ").\n",
-              fi);
-      return false;
-    }
     if (!fu.lf_global_spline_region_valid) {
       fprintf(stderr,
               "jxltran: --set-splines-from: spline entropy insert/replace span "
@@ -1064,6 +1360,9 @@ bool ApplySplinesFromFile(ParsedCodestream* cs, const char* path,
     }
     const bool had_splines = (fu.frame.flags & kFrameFlagSplines) != 0;
     if (had_splines) {
+      if (summary != nullptr) {
+        summary->replaced_existing_splines = true;
+      }
       if (fu.lf_global_spline_region_abs_start_bit >=
           fu.lf_global_spline_region_abs_end_bit) {
         fprintf(stderr,
@@ -1171,6 +1470,16 @@ bool ApplySplinesFromFile(ParsedCodestream* cs, const char* path,
         return false;
       }
       fu.toc_decoded_sizes[p0] = static_cast<uint32_t>(ns0);
+      if (!EnsureSplineEditLfChunk0Budget(&fu)) {
+        fprintf(stderr,
+                "jxltran: --set-splines-from: frame %" PRIuS " LF-global TOC budget "
+                "does not match spline splice (internal)\n",
+                fi);
+        return false;
+      }
+    }
+    if (summary != nullptr && !had_splines) {
+      summary->added_on_spline_free.emplace_back(fi, fu.spline_edit_delta_bits);
     }
     ++applied;
   }
@@ -1181,6 +1490,291 @@ bool ApplySplinesFromFile(ParsedCodestream* cs, const char* path,
             "file, parse error, or no matching frame indices)\n");
     return false;
   }
+  return true;
+}
+
+bool ApplyRemoveSplinesAddOnly(ParsedCodestream* cs, size_t fi,
+                               const int64_t* exact_forward_body_delta_bits) {
+  if (fi >= cs->frames.size()) {
+    fprintf(stderr,
+            "jxltran: --clear-splines-frames: frame %" PRIuS " is out of range\n",
+            fi);
+    return false;
+  }
+  FramedUnit& fu = cs->frames[fi];
+  if (!fu.lf_global_spline_region_valid) {
+    fprintf(stderr,
+            "jxltran: --clear-splines-frames: spline entropy span unknown for frame "
+            "%" PRIuS " (LF-global prefix not parsed)\n",
+            fi);
+    return false;
+  }
+  if (fu.toc_strip_perm_reorder) {
+    fprintf(stderr,
+            "jxltran: --clear-splines-frames: incompatible with stripped TOC "
+            "permutation (frame %" PRIuS ")\n",
+            fi);
+    return false;
+  }
+  if ((fu.frame.flags & kFrameFlagSplines) == 0) {
+    fprintf(stderr,
+            "jxltran: --clear-splines-frames: frame %" PRIuS " has no splines flag\n",
+            fi);
+    return false;
+  }
+  const int64_t old_span_bits = static_cast<int64_t>(
+      fu.lf_global_spline_region_abs_end_bit -
+      fu.lf_global_spline_region_abs_start_bit);
+  if (old_span_bits <= 0) {
+    fprintf(stderr,
+            "jxltran: --clear-splines-frames: frame %" PRIuS " has no spline entropy "
+            "to remove\n",
+            fi);
+    return false;
+  }
+  int64_t delta_bits;
+  if (exact_forward_body_delta_bits != nullptr) {
+    const int64_t D = *exact_forward_body_delta_bits;
+    if (D <= 0 || (D % 8) != 0) {
+      fprintf(stderr,
+              "jxltran: internal spline undo: invalid forward body delta (%lld) "
+              "for frame %" PRIuS "\n",
+              static_cast<long long>(D), fi);
+      return false;
+    }
+    if (static_cast<int64_t>(fu.body_bit_length) < D) {
+      fprintf(stderr,
+              "jxltran: internal spline undo: body shorter than forward delta "
+              "(%" PRIuS ")\n",
+              fi);
+      return false;
+    }
+    delta_bits = -D;
+  } else {
+    const int64_t new_span_bits = 0;
+    const int64_t delta_content = new_span_bits - old_span_bits;
+    const int64_t old_body_bits = static_cast<int64_t>(fu.body_bit_length);
+    const int64_t new_body_core = old_body_bits + delta_content;
+    if (new_body_core < 0) {
+      fprintf(stderr,
+              "jxltran: --clear-splines-frames: frame %" PRIuS " edit would make "
+              "negative body length\n",
+              fi);
+      return false;
+    }
+    int64_t phase_mod = new_body_core % 8;
+    if (phase_mod < 0) {
+      phase_mod += 8;
+    }
+    const int64_t body_tail_pad = (8 - phase_mod) % 8;
+    delta_bits = delta_content + body_tail_pad;
+  }
+  fu.spline_edit = true;
+  fu.spline_edit_new_mid_bytes.clear();
+  fu.spline_edit_new_mid_bits = 0;
+  fu.spline_edit_delta_bits = delta_bits;
+  fu.spline_edit_toc_reencode =
+      !fu.toc_perm.empty() && fu.spline_edit_delta_bits != 0;
+  fu.frame.flags &= ~static_cast<uint64_t>(kFrameFlagSplines);
+  fu.lf_global_splines.reset();
+  // Keep lf_global_spline_*_{start,end}_bit as parsed from the source codestream
+  // (the spline entropy span in LF-global). WriteCodestream splices that span
+  // out using empty replacement bits; collapsing end to start would make the
+  // splice a no-op and leave spline entropy in the output.
+
+  fu.body_bit_length = static_cast<size_t>(
+      static_cast<int64_t>(fu.body_bit_length) + delta_bits);
+  if (!fu.toc_decoded_sizes.empty()) {
+    size_t p0 = 0;
+    if (fu.toc_perm.empty()) {
+      p0 = 0;
+    } else {
+      bool found = false;
+      for (size_t p = 0; p < fu.toc_perm.size(); ++p) {
+        if (fu.toc_perm[p] == 0) {
+          p0 = p;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        fprintf(stderr,
+                "jxltran: --clear-splines-frames: invalid TOC permutation (frame "
+                "%" PRIuS ")\n",
+                fi);
+        return false;
+      }
+    }
+    const int64_t dbytes = delta_bits / 8;
+    const int64_t ns0 =
+        static_cast<int64_t>(fu.toc_decoded_sizes[p0]) + dbytes;
+    if (ns0 < 0 || ns0 > UINT32_MAX) {
+      fprintf(stderr,
+              "jxltran: --clear-splines-frames: DC global section size invalid "
+              "(frame %" PRIuS ")\n",
+              fi);
+      return false;
+    }
+    fu.toc_decoded_sizes[p0] = static_cast<uint32_t>(ns0);
+    if (!EnsureSplineEditLfChunk0Budget(&fu)) {
+      fprintf(stderr,
+              "jxltran: spline undo: frame %" PRIuS " LF-global TOC budget does not "
+              "match spline splice (internal)\n",
+              fi);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ApplyClearSplinesOnFrames(ParsedCodestream* cs,
+                               const std::vector<size_t>& frame_indices) {
+  std::vector<size_t> uniq = frame_indices;
+  std::sort(uniq.begin(), uniq.end());
+  uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+  for (size_t fi : uniq) {
+    if (!ApplyRemoveSplinesAddOnly(cs, fi)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+uint8_t ComputeLfGlobalChunk0TailPaddingTrimBytes(
+    const uint8_t* long_cs, size_t long_sz, const ParsedCodestream& long_parsed,
+    const uint8_t* ref_cs, size_t ref_sz, const ParsedCodestream& ref_parsed,
+    size_t frame_index) {
+  if (frame_index >= long_parsed.frames.size() ||
+      frame_index >= ref_parsed.frames.size()) {
+    return 0;
+  }
+  const FramedUnit& L = long_parsed.frames[frame_index];
+  const FramedUnit& R = ref_parsed.frames[frame_index];
+  if (L.toc_decoded_sizes.empty() || R.toc_decoded_sizes.empty()) {
+    return 0;
+  }
+  std::vector<std::vector<uint8_t>> chunksL, chunksR;
+  if (!ExtractFramedUnitBodyStreamChunks(long_cs, long_sz, L, &chunksL) ||
+      !ExtractFramedUnitBodyStreamChunks(ref_cs, ref_sz, R, &chunksR)) {
+    return 0;
+  }
+  size_t p0L = 0;
+  size_t p0R = 0;
+  if (!PhysicalStreamIndexForLogical0(L, &p0L) ||
+      !PhysicalStreamIndexForLogical0(R, &p0R)) {
+    return 0;
+  }
+  if (p0L >= chunksL.size() || p0R >= chunksR.size()) {
+    return 0;
+  }
+  const std::vector<uint8_t>& cL = chunksL[p0L];
+  const std::vector<uint8_t>& cR = chunksR[p0R];
+  if (cL.size() < cR.size()) {
+    return 0;
+  }
+  const size_t delta = cL.size() - cR.size();
+  if (delta == 0 || delta > 255) {
+    return 0;
+  }
+  if (memcmp(cL.data(), cR.data(), cR.size()) != 0) {
+    return 0;
+  }
+  for (size_t i = cR.size(); i < cL.size(); ++i) {
+    if (cL[i] != 0) {
+      return 0;
+    }
+  }
+  return static_cast<uint8_t>(delta);
+}
+
+bool ApplyLfGlobalPhysicalChunk0TailTrim(ParsedCodestream* cs, size_t fi,
+                                         uint8_t trim_bytes) {
+  if (trim_bytes == 0) {
+    return true;
+  }
+  if (trim_bytes > 255) {
+    fprintf(stderr,
+            "jxltran: --lf-global-chunk0-tail-trim-bytes: trim count %u is out of "
+            "range (max 255)\n",
+            static_cast<unsigned>(trim_bytes));
+    return false;
+  }
+  if (fi >= cs->frames.size()) {
+    fprintf(stderr,
+            "jxltran: --lf-global-chunk0-tail-trim-bytes: frame %" PRIuS " is out "
+            "of range\n",
+            fi);
+    return false;
+  }
+  FramedUnit& fu = cs->frames[fi];
+  if (!fu.spline_edit || fu.spline_edit_new_mid_bits != 0) {
+    fprintf(stderr,
+            "jxltran: --lf-global-chunk0-tail-trim-bytes: frame %" PRIuS " must "
+            "follow --clear-splines-frames on the same pass\n",
+            fi);
+    return false;
+  }
+  if (fu.toc_decoded_sizes.empty() || fu.toc_strip_perm_reorder) {
+    fprintf(stderr,
+            "jxltran: --lf-global-chunk0-tail-trim-bytes: frame %" PRIuS " has no "
+            "TOC sizes or uses stripped TOC permutation\n",
+            fi);
+    return false;
+  }
+  size_t p0 = 0;
+  if (!PhysicalStreamIndexForLogical0(fu, &p0)) {
+    fprintf(stderr,
+            "jxltran: --lf-global-chunk0-tail-trim-bytes: frame %" PRIuS " has "
+            "invalid TOC permutation\n",
+            fi);
+    return false;
+  }
+  if (fu.toc_decoded_sizes[p0] < trim_bytes) {
+    fprintf(stderr,
+            "jxltran: --lf-global-chunk0-tail-trim-bytes: frame %" PRIuS " section "
+            "0 too small to trim\n",
+            fi);
+    return false;
+  }
+  const int64_t bits = static_cast<int64_t>(trim_bytes) * 8;
+  if (static_cast<int64_t>(fu.body_bit_length) < bits) {
+    fprintf(stderr,
+            "jxltran: --lf-global-chunk0-tail-trim-bytes: frame %" PRIuS " body "
+            "too small\n",
+            fi);
+    return false;
+  }
+  fu.toc_decoded_sizes[p0] =
+      static_cast<uint32_t>(static_cast<int64_t>(fu.toc_decoded_sizes[p0]) -
+                            static_cast<int64_t>(trim_bytes));
+  fu.body_bit_length =
+      static_cast<size_t>(static_cast<int64_t>(fu.body_bit_length) - bits);
+  // WriteCodestream derives source LF-global chunk0 size from
+  // toc_decoded_sizes[p0] - spline_edit_delta_bits/8. Tail trim shrinks the
+  // target chunk0 without updating that delta, which would make old_c0_bytes
+  // too small vs the on-disk output (missing trailing zero padding bytes).
+  fu.spline_edit_delta_bits -= bits;
+  if (!EnsureSplineEditLfChunk0Budget(&fu)) {
+    return false;
+  }
+  return true;
+}
+
+bool ApplyFrameBlendExactRestore(ParsedCodestream* cs, size_t frame_index,
+                                 const FrameBlendingInfo& main,
+                                 const std::vector<FrameBlendingInfo>& ec,
+                                 uint32_t save_as_reference) {
+  if (frame_index >= cs->frames.size()) {
+    return false;
+  }
+  FrameHeader& fh = cs->frames[frame_index].frame;
+  if (fh.frame_type != kFrameTypeRegular &&
+      fh.frame_type != kFrameTypeSkipProgressive) {
+    return false;
+  }
+  fh.blending_info = main;
+  fh.ec_blending_info = ec;
+  fh.save_as_reference = save_as_reference;
   return true;
 }
 
@@ -1417,7 +2011,8 @@ bool ApplySetFrameNames(
 
 bool ApplyKeepListedFrames(ParsedCodestream* cs,
                            const std::vector<size_t>& frames_in_order,
-                           bool* out_changed) {
+                           bool* out_changed, KeepReorderUndoSpec* undo_out) {
+  if (undo_out) undo_out->clear();
   if (out_changed) *out_changed = false;
   if (frames_in_order.empty()) {
     fprintf(stderr,
@@ -1425,15 +2020,16 @@ bool ApplyKeepListedFrames(ParsedCodestream* cs,
             "--frames list\n");
     return false;
   }
+  const size_t n_src_frames = cs->frames.size();
   std::vector<size_t> order;
   order.reserve(frames_in_order.size());
   for (size_t idx : frames_in_order) {
-    if (idx >= cs->frames.size()) {
+    if (idx >= n_src_frames) {
       fprintf(stderr,
               "jxltran: --frames/--keep-frames: index %" PRIuS " out of range "
               "(codestream has "
               "%" PRIuS " frames)\n",
-              idx, cs->frames.size());
+              idx, n_src_frames);
       return false;
     }
     bool seen = false;
@@ -1446,7 +2042,7 @@ bool ApplyKeepListedFrames(ParsedCodestream* cs,
     if (!seen) order.push_back(idx);
   }
 
-  bool identity_ordered = order.size() == cs->frames.size();
+  bool identity_ordered = order.size() == n_src_frames;
   if (identity_ordered) {
     for (size_t i = 0; i < order.size(); ++i) {
       if (order[i] != i) {
@@ -1457,7 +2053,7 @@ bool ApplyKeepListedFrames(ParsedCodestream* cs,
   }
 
   std::vector<std::pair<bool, uint32_t>> tail_before;
-  tail_before.reserve(cs->frames.size());
+  tail_before.reserve(n_src_frames);
   for (const FramedUnit& fu : cs->frames) {
     const FrameHeader& fh = fu.frame;
     if (fh.frame_type == kFrameTypeLF ||
@@ -1465,6 +2061,30 @@ bool ApplyKeepListedFrames(ParsedCodestream* cs,
       tail_before.emplace_back(false, 0);
     } else {
       tail_before.emplace_back(fh.is_last, fh.save_as_reference);
+    }
+  }
+
+  if (undo_out && order.size() == n_src_frames) {
+    std::vector<uint8_t> seen(n_src_frames, 0);
+    bool bijective = true;
+    for (size_t idx : order) {
+      if (idx >= n_src_frames || seen[idx]) {
+        bijective = false;
+        break;
+      }
+      seen[idx] = 1;
+    }
+    if (bijective) {
+      for (size_t i = 0; i < n_src_frames; ++i) {
+        if (!seen[i]) {
+          bijective = false;
+          break;
+        }
+      }
+    }
+    if (bijective) {
+      undo_out->forward_order = order;
+      undo_out->tail_before = tail_before;
     }
   }
 
@@ -1541,6 +2161,37 @@ bool ApplyKeepListedFrames(ParsedCodestream* cs,
       }
       *out_changed = diff;
     }
+  }
+  return true;
+}
+
+bool ApplyKeepListedFramesReorderInverse(ParsedCodestream* cs,
+                                         const KeepReorderUndoSpec& undo) {
+  if (undo.forward_order.empty()) return true;
+  const size_t n = cs->frames.size();
+  if (undo.forward_order.size() != n || undo.tail_before.size() != n) {
+    return false;
+  }
+  std::vector<size_t> inv(n, n);
+  for (size_t j = 0; j < n; ++j) {
+    const size_t src = undo.forward_order[j];
+    if (src >= n || inv[src] != n) return false;
+    inv[src] = j;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (inv[i] == n) return false;
+  }
+  std::vector<FramedUnit> src = std::move(cs->frames);
+  std::vector<FramedUnit> out;
+  out.reserve(n);
+  for (size_t orig_i = 0; orig_i < n; ++orig_i) {
+    out.push_back(std::move(src[inv[orig_i]]));
+  }
+  cs->frames = std::move(out);
+  for (size_t i = 0; i < n; ++i) {
+    FrameHeader& fh = cs->frames[i].frame;
+    fh.is_last = undo.tail_before[i].first;
+    fh.save_as_reference = undo.tail_before[i].second;
   }
   return true;
 }

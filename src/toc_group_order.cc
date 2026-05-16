@@ -348,4 +348,53 @@ bool ApplyTocGroupOrder(ParsedCodestream* cs, TocGroupOrderCli order,
   return true;
 }
 
+void CopyFramedUnitTocSnapshot(const FramedUnit& fu, FramedUnitTocSnapshot* snap) {
+  snap->toc_decoded_sizes = fu.toc_decoded_sizes;
+  snap->toc_perm = fu.toc_perm;
+  snap->toc_bits_before_sizes = fu.toc_bits_before_sizes;
+  snap->toc_strip_perm_reorder = fu.toc_strip_perm_reorder;
+  snap->toc_strip_stream_sizes = fu.toc_strip_stream_sizes;
+  snap->toc_strip_logical_to_stream = fu.toc_strip_logical_to_stream;
+  snap->toc_body_stream_shuffle = fu.toc_body_stream_shuffle;
+  snap->toc_body_shuffle_src_sizes = fu.toc_body_shuffle_src_sizes;
+}
+
+void RestoreFramedUnitTocSnapshot(const FramedUnitTocSnapshot& snap, FramedUnit* fu) {
+  fu->toc_decoded_sizes = snap.toc_decoded_sizes;
+  fu->toc_perm = snap.toc_perm;
+  fu->toc_bits_before_sizes = snap.toc_bits_before_sizes;
+  fu->toc_strip_perm_reorder = snap.toc_strip_perm_reorder;
+  fu->toc_strip_stream_sizes = snap.toc_strip_stream_sizes;
+  fu->toc_strip_logical_to_stream = snap.toc_strip_logical_to_stream;
+  fu->toc_body_stream_shuffle = snap.toc_body_stream_shuffle;
+  fu->toc_body_shuffle_src_sizes = snap.toc_body_shuffle_src_sizes;
+}
+
+bool CaptureTocSnapshotsBeforeGroupOrder(const ParsedCodestream& cs,
+                                         const std::vector<size_t>* only_frames,
+                                         std::vector<FramedUnitTocSnapshot>* out_snaps) {
+  out_snaps->clear();
+  const uint32_t cw = cs.image.size.width;
+  const uint32_t ch = cs.image.size.height;
+  const auto want = [&](size_t idx) -> bool {
+    if (only_frames == nullptr || only_frames->empty()) return true;
+    return std::binary_search(only_frames->begin(), only_frames->end(), idx);
+  };
+  for (size_t fi = 0; fi < cs.frames.size(); ++fi) {
+    if (!want(fi)) continue;
+    const FramedUnit& fu = cs.frames[fi];
+    const uint32_t ft = fu.frame.frame_type;
+    if (ft == kFrameTypeLF || ft == kFrameTypeReferenceOnly) continue;
+    if (ft != kFrameTypeRegular && ft != kFrameTypeSkipProgressive) continue;
+    FrameTocMetrics tm;
+    ComputeFrameTocMetrics(fu.frame, cs.image.metadata, cw, ch, &tm);
+    if (tm.all_in_one_section || tm.num_toc_entries <= 1) continue;
+    FramedUnitTocSnapshot snap;
+    snap.frame_index = fi;
+    CopyFramedUnitTocSnapshot(fu, &snap);
+    out_snaps->push_back(std::move(snap));
+  }
+  return true;
+}
+
 }  // namespace jxltran

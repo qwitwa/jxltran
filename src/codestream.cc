@@ -112,6 +112,30 @@ static size_t PhotonNoiseRelInLfSection(const FramedUnit& fu,
   return fu.lf_global_noise_lut_rel_bit;
 }
 
+// |noise_rel|, |spline_start|, |spline_end_excl| share one coordinate system
+// (LF-bundle-relative bits for permuted spline rebuild; chunk0-relative for the
+// simple-TOC inline path). Noise must lie entirely before the spline span or
+// entirely at/after spline_end_excl (noise starts where the parsed bundle ends).
+static bool NoiseRelAfterSplineSplice(size_t noise_rel, size_t spline_start,
+                                      size_t spline_end_excl, size_t new_mid_bits,
+                                      size_t* out_rel) {
+  if (noise_rel + 80 <= spline_start) {
+    *out_rel = noise_rel;
+    return true;
+  }
+  if (noise_rel >= spline_end_excl) {
+    *out_rel =
+        noise_rel + new_mid_bits - (spline_end_excl - spline_start);
+    return true;
+  }
+  return false;
+}
+
+static int64_t PhotonTocChunk0AdjustBytes(const FramedUnit& fu) {
+  return fu.photon_noise_edit ? static_cast<int64_t>(fu.photon_noise_delta_bytes)
+                              : 0;
+}
+
 // perm[s] = logical TOC index carried in stream-order slot s.
 static bool PhysicalStreamIndexForLogical0(const FramedUnit& fu, size_t* p0) {
   if (fu.toc_decoded_sizes.empty()) return false;
@@ -221,20 +245,27 @@ static bool BuildSplineStreamOrderBody(const FramedUnit& fu, const uint8_t* orig
     return false;
   }
   std::vector<uint32_t> old_stream = fu.toc_decoded_sizes;
-  if (dbytes != 0) {
-    old_stream[p0] = static_cast<uint32_t>(
-        static_cast<int64_t>(old_stream[p0]) - dbytes);
+  const int64_t photon_adj = PhotonTocChunk0AdjustBytes(fu);
+  const int64_t stream_slot_adj = dbytes + photon_adj;
+  if (stream_slot_adj != 0) {
+    const int64_t v =
+        static_cast<int64_t>(old_stream[p0]) - stream_slot_adj;
+    if (v < 0 || v > static_cast<int64_t>(UINT32_MAX)) {
+      return false;
+    }
+    old_stream[p0] = static_cast<uint32_t>(v);
   }
   uint64_t sum_old = 0;
   for (uint32_t sz : old_stream) {
     sum_old += static_cast<uint64_t>(sz);
   }
   const int64_t new_bits = static_cast<int64_t>(fu.body_bit_length);
-  if (new_bits < delta_bits) {
+  const int64_t photon_bits = photon_adj * 8;
+  if (new_bits < delta_bits + photon_bits) {
     return false;
   }
   const uint64_t old_body_bytes =
-      static_cast<uint64_t>((new_bits - delta_bits) / 8);
+      static_cast<uint64_t>((new_bits - delta_bits - photon_bits) / 8);
   if (sum_old != old_body_bytes) {
     return false;
   }
@@ -248,14 +279,39 @@ static bool BuildSplineStreamOrderBody(const FramedUnit& fu, const uint8_t* orig
   }
   const size_t rel_start = fu.lf_global_spline_rel_start_bit;
   const size_t rel_end = fu.lf_global_spline_rel_end_bit;
+  const int64_t spline_only_c0_bytes =
+      static_cast<int64_t>(fu.toc_decoded_sizes[p0]) - photon_adj;
+  if (spline_only_c0_bytes < 0 ||
+      spline_only_c0_bytes > static_cast<int64_t>(UINT32_MAX)) {
+    return false;
+  }
+  const size_t spline_only_c0_bits =
+      static_cast<size_t>(static_cast<uint32_t>(spline_only_c0_bytes)) * 8u;
   std::vector<uint8_t> new_p0;
   if (!SpliceLfSplineEntropy(
           chunks[p0], rel_start, rel_end, fu.spline_edit_new_mid_bytes,
-          fu.spline_edit_new_mid_bits,
-          static_cast<size_t>(fu.toc_decoded_sizes[p0]) * 8u, &new_p0)) {
+          fu.spline_edit_new_mid_bits, spline_only_c0_bits, &new_p0)) {
     return false;
   }
   chunks[p0] = std::move(new_p0);
+  if (fu.photon_noise_edit) {
+    const size_t noise_rel0 = PhotonNoiseRelInLfSection(fu, body_src_abs_bit);
+    size_t noise_adj = 0;
+    if (!NoiseRelAfterSplineSplice(noise_rel0, rel_start, rel_end,
+                                   fu.spline_edit_new_mid_bits, &noise_adj)) {
+      fprintf(stderr,
+              "jxltran: spline+photon: noise LUT position overlaps spline entropy "
+              "(TOC permutation path)\n");
+      return false;
+    }
+    if (!SpliceLfPhotonNoise(chunks[p0], noise_adj, photon_adj,
+                             fu.photon_noise_new_bytes, &chunks[p0])) {
+      fprintf(stderr,
+              "jxltran: spline+photon: LF-global photon noise splice failed (TOC "
+              "permutation path)\n");
+      return false;
+    }
+  }
   out->clear();
   for (size_t s = 0; s < n; ++s) {
     const std::vector<uint8_t>& ch = chunks[s];
@@ -595,6 +651,10 @@ bool ReadCodestream(const uint8_t* data, size_t size, ParsedCodestream* out) {
                 fu.lf_global_noise_lut_rel_bit = parsed.noise_lut_start_bit;
                 fu.lf_global_noise_lut_abs_bit =
                     lf0_abs + parsed.noise_lut_start_bit;
+                if (parsed.noise_lut_bytes_valid) {
+                  fu.lf_global_noise_raw_valid = true;
+                  fu.lf_global_noise_raw_bytes = parsed.noise_lut_bytes;
+                }
                 if (parsed.splines.has_value()) {
                   fu.lf_global_splines = std::move(*parsed.splines);
                 }
@@ -683,9 +743,15 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
                     wframe, fu.original_frame_byte_offset, fu.toc_bit_length,
                     fu.body_bit_length);
     }
-    // [frame_header] from |fu.frame|, then verbatim TOC, then verbatim body.
-    // The frame header may change length (e.g. crop); TOC is unchanged for now.
-    // The body is whole bytes; use AppendRawBytes when the writer is aligned.
+    // [frame_header] from |fu.frame|, then TOC, then body.
+    // When the TOC permutation is unchanged, the size list (U32 section byte
+    // lengths) encodes deterministically: matching |fu.toc_decoded_sizes| to the
+    // body is sufficient; the only TOC entry we resize for these edits is the
+    // physical slot carrying logical LF-global (section 0). Non-empty
+    // permutations may still admit multiple valid Lehmer/ANS bitstreams, so we
+    // copy the source TOC verbatim when nothing in the frame forces a rewrite.
+    // The frame header may change length (e.g. crop). The body is whole bytes;
+    // use AppendRawBytes when the writer is aligned.
     if (!WriteFrameHeader(bw, fu.frame, cs.image.metadata, frame_base,
                           meta_canvas_w, meta_canvas_h)) {
       fprintf(stderr, "jxltran: failed to write frame header\n");
@@ -712,10 +778,6 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
                       need_toc_rewrite ? 1 : 0);
     }
     const bool perm_nonempty = !fu.toc_perm.empty();
-    const bool can_partial_toc =
-        !strip_body && !shuffle_body && perm_nonempty && need_toc_rewrite &&
-        fu.toc_bits_before_sizes > 0 &&
-        fu.toc_bits_before_sizes <= fu.toc_bit_length;
 
     if (!need_toc_rewrite) {
       bw.AppendBitsRange(original, frame_bit_base + toc_rel, fu.toc_bit_length);
@@ -743,13 +805,6 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
           fprintf(stderr,
                   "jxltran: failed to re-encode TOC (header/TOC bit phase "
                   "changed)\n");
-          return false;
-        }
-      } else if (can_partial_toc) {
-        bw.AppendBitsRange(original, frame_bit_base + toc_rel,
-                            fu.toc_bits_before_sizes);
-        if (!WriteTocSizeList(bw, fu.toc_decoded_sizes)) {
-          fprintf(stderr, "jxltran: failed to re-encode TOC sizes\n");
           return false;
         }
       } else {
@@ -813,8 +868,10 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
       const size_t s1 = fu.lf_global_spline_region_abs_end_bit;
       const size_t a0 = body_src_abs_bit;
       const int64_t delta_bits = fu.spline_edit_delta_bits;
+      const int64_t photon_adj_b = PhotonTocChunk0AdjustBytes(fu);
+      const int64_t photon_bits_adj = photon_adj_b * 8;
       const size_t old_body_bits = static_cast<size_t>(
-          static_cast<int64_t>(fu.body_bit_length) - delta_bits);
+          static_cast<int64_t>(fu.body_bit_length) - delta_bits - photon_bits_adj);
       const size_t body_end_orig = a0 + old_body_bits;
       if (s0 < a0 || s1 < s0 || s1 > body_end_orig) {
         fprintf(stderr, "jxltran: spline edit: bad patch span\n");
@@ -840,13 +897,14 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
       const int64_t dbytes = delta_bits / 8;
       const int64_t new_c0_bytes =
           static_cast<int64_t>(fu.toc_decoded_sizes[p0]);
-      const int64_t old_c0_bytes_i = new_c0_bytes - dbytes;
+      const int64_t old_c0_bytes_i = new_c0_bytes - dbytes - photon_adj_b;
       if (old_c0_bytes_i < 0 ||
           old_c0_bytes_i > static_cast<int64_t>(UINT32_MAX)) {
         fprintf(stderr,
                 "jxltran: spline edit: TOC size mismatch (internal, "
-                "delta_bytes=%lld)\n",
-                static_cast<long long>(dbytes));
+                "delta_bytes=%lld photon_adj_bytes=%lld)\n",
+                static_cast<long long>(dbytes),
+                static_cast<long long>(photon_adj_b));
         return false;
       }
       const uint32_t old_c0_bytes =
@@ -858,11 +916,19 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
                 "section (not supported)\n");
         return false;
       }
-      bw.AppendBitsRange(original, a0, s0 - a0);
       const std::vector<uint8_t>& mid = fu.spline_edit_new_mid_bytes;
       const size_t mid_bits = fu.spline_edit_new_mid_bits;
-      const size_t new_c0_bits =
-          static_cast<size_t>(fu.toc_decoded_sizes[p0]) * 8u;
+      const int64_t spline_only_c0_bytes =
+          new_c0_bytes - photon_adj_b;
+      if (spline_only_c0_bytes < 0 ||
+          spline_only_c0_bytes > static_cast<int64_t>(UINT32_MAX)) {
+        fprintf(stderr,
+                "jxltran: spline edit: TOC size mismatch after photon adjustment "
+                "(internal)\n");
+        return false;
+      }
+      const size_t spline_only_c0_bits =
+          static_cast<size_t>(static_cast<uint32_t>(spline_only_c0_bytes)) * 8u;
       const size_t c0_payload_bits =
           (s0 - a0) + mid_bits + (chunk0_end_abs - s1);
       if (TraceIsOn()) {
@@ -873,23 +939,59 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
             " c0_tail_bits=%" PRIuS " new_c0_bits=%" PRIuS " c0_payload_bits=%"
             PRIuS "",
             a0, s0, s1, chunk0_end_abs, body_end_orig, s0 - a0, mid_bits,
-            chunk0_end_abs - s1, new_c0_bits, c0_payload_bits);
+            chunk0_end_abs - s1, spline_only_c0_bits, c0_payload_bits);
       }
       if (mid_bits > mid.size() * 8u) {
         fprintf(stderr, "jxltran: spline edit: invalid mid bit length\n");
         return false;
       }
+      BitWriter c0_bw;
+      c0_bw.AppendBitsRange(original, a0, s0 - a0);
       for (size_t bi = 0; bi < mid_bits; ++bi) {
-        bw.WriteBits(1, (mid[bi >> 3] >> (bi & 7)) & 1);
+        c0_bw.WriteBits(1, (mid[bi >> 3] >> (bi & 7)) & 1);
       }
-      bw.AppendBitsRange(original, s1, chunk0_end_abs - s1);
-      if (new_c0_bits < c0_payload_bits) {
-        fprintf(stderr, "jxltran: spline edit: new LF-global section too small\n");
+      c0_bw.AppendBitsRange(original, s1, chunk0_end_abs - s1);
+      if (spline_only_c0_bits < c0_payload_bits) {
+        fprintf(stderr,
+                "jxltran: spline edit: LF-global TOC section 0 is smaller than the "
+                "spliced payload (TOC/body bookkeeping bug; chunk %" PRIuS ")\n",
+                p0);
         return false;
       }
-      for (size_t z = c0_payload_bits; z < new_c0_bits; ++z) {
-        bw.WriteBits(1, 0);
+      for (size_t z = c0_payload_bits; z < spline_only_c0_bits; ++z) {
+        c0_bw.WriteBits(1, 0);
       }
+      std::vector<uint8_t> c0_bytes = c0_bw.TakeBytes();
+      if (fu.photon_noise_edit) {
+        const size_t noise_rel = fu.photon_noise_patch_abs_bit - a0;
+        size_t noise_adj = 0;
+        if (!NoiseRelAfterSplineSplice(noise_rel, s0 - a0, s1 - a0, mid_bits,
+                                       &noise_adj)) {
+          fprintf(stderr,
+                  "jxltran: spline+photon: noise LUT position overlaps spline "
+                  "entropy\n");
+          return false;
+        }
+        std::vector<uint8_t> c0_out;
+        if (!SpliceLfPhotonNoise(c0_bytes, noise_adj, photon_adj_b,
+                                 fu.photon_noise_new_bytes, &c0_out)) {
+          fprintf(stderr,
+                  "jxltran: spline+photon: photon noise splice in LF-global chunk "
+                  "failed\n");
+          return false;
+        }
+        c0_bytes = std::move(c0_out);
+      }
+      const size_t new_c0_bits =
+          static_cast<size_t>(fu.toc_decoded_sizes[p0]) * 8u;
+      if (c0_bytes.size() * 8u != new_c0_bits) {
+        fprintf(stderr,
+                "jxltran: spline edit: LF-global TOC section 0 byte length mismatch "
+                "(%" PRIuS " bytes vs %" PRIuS " bits)\n",
+                c0_bytes.size(), new_c0_bits);
+        return false;
+      }
+      bw.AppendRawBytes(c0_bytes.data(), c0_bytes.size());
       bw.AppendBitsRange(original, chunk0_end_abs, body_end_orig - chunk0_end_abs);
       if ((bw.bit_pos() & 7u) != 0u) {
         fprintf(stderr, "jxltran: spline edit: internal body alignment error\n");
@@ -951,6 +1053,20 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
   }
   *out = bw.TakeBytes();
   return true;
+}
+
+bool ExtractFramedUnitBodyStreamChunks(const uint8_t* original, size_t orig_size,
+                                       const FramedUnit& fu,
+                                       std::vector<std::vector<uint8_t>>* chunks_out) {
+  if (fu.toc_decoded_sizes.empty()) {
+    chunks_out->clear();
+    return true;
+  }
+  const size_t frame_bit_base = fu.original_frame_byte_offset * 8;
+  const size_t body_src_abs_bit =
+      frame_bit_base + fu.toc_start_bit + fu.toc_bit_length;
+  return ExtractStreamOrderBodyChunks(original, orig_size, body_src_abs_bit,
+                                      fu.toc_decoded_sizes, chunks_out);
 }
 
 }  // namespace jxltran

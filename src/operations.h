@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "codestream.h"
+#include "restoration_filter.h"
 
 namespace jxltran {
 
@@ -117,6 +118,11 @@ bool ApplyEpfSharpUniformity(ParsedCodestream* cs, float uniformity,
                              const std::vector<size_t>* only_frames = nullptr,
                              bool* out_changed = nullptr);
 
+// Restores the frame restoration bundle (Gaborish + EPF fields) verbatim for
+// lossless undo of --set-epf-*.
+bool ApplyRestorationFilterExactRestore(ParsedCodestream* cs, size_t frame_index,
+                                        const ParsedRestorationFilter& rf);
+
 // Photon noise: |change| false = leave bitstream noise as-is. |iso| == 0
 // clears kNoise and removes the 80-bit LUT from DC global (when present).
 // |iso| > 0 sets kNoise and LUT from the same ISO model as libjxl
@@ -131,6 +137,39 @@ bool ApplyEpfSharpUniformity(ParsedCodestream* cs, float uniformity,
 bool ApplyPhotonNoiseIso(ParsedCodestream* cs, bool change, float iso,
                          const std::vector<size_t>* only_frames = nullptr);
 
+// Forward photon-noise edit kind (what the user run did); used for undo.
+enum class PhotonNoiseForwardKind { kInsert, kReplace, kRemove };
+
+struct PhotonNoiseUndoSpec {
+  size_t frame_index = 0;
+  PhotonNoiseForwardKind forward_kind = PhotonNoiseForwardKind::kInsert;
+  // Bytes present before the forward op (meaningful for kReplace / kRemove).
+  std::array<uint8_t, 10> prior_bytes{};
+};
+
+// Inverse of one per-frame photon splice from ApplyPhotonNoiseIso /
+// ApplyPhotonNoiseWeights.
+bool ApplyPhotonNoiseUndo(ParsedCodestream* cs, const PhotonNoiseUndoSpec& spec);
+
+// |weights_spec|: either eight comma-separated floats (same scale as the ISO
+// model LUT) or 20 lowercase hex digits for the verbatim 10-byte bitstream
+// block. ISO=0 semantics: all-zero / empty LUT removes kNoise when present.
+// Mutually exclusive with ApplyPhotonNoiseIso on the same invocation.
+bool ApplyPhotonNoiseWeights(ParsedCodestream* cs, bool change,
+                             const char* weights_spec,
+                             const std::vector<size_t>* only_frames = nullptr);
+
+// Summary from the last successful per-frame decisions inside
+// |ApplySplinesFromFile| (optional).
+struct SplinesApplySummary {
+  // Frames that had no kSplines / empty spline span before the edit and now
+  // carry a new bundle (losslessly removable via |ApplyRemoveSplinesAddOnly|).
+  // Second value is |FramedUnit::spline_edit_delta_bits| after the insert (the
+  // exact body growth including LF-global tail padding); verify undo negates it.
+  std::vector<std::pair<size_t, int64_t>> added_on_spline_free;
+  bool replaced_existing_splines = false;
+};
+
 // Replace or insert LF-global spline entropy from a text file (see
 // --extract-splines). Requires a successful LF-global prefix parse at read
 // time. If the frame had no kSplines flag, the flag is set and a new bundle is
@@ -141,9 +180,44 @@ bool ApplyPhotonNoiseIso(ParsedCodestream* cs, bool change, float iso,
 // trailing zero bits already present as encoder padding in the last body byte
 // cannot be distinguished from payload—at worst roughly one redundant byte
 // may be emitted versus a full LF-global decode (out of scope). Incompatible
-// with --set-photon-noise-iso on the same frame or TOC strip on the same pass.
+// with stripped TOC permutation on the same pass.
 bool ApplySplinesFromFile(ParsedCodestream* cs, const char* path,
-                          const std::vector<size_t>* only_frames = nullptr);
+                          const std::vector<size_t>* only_frames = nullptr,
+                          SplinesApplySummary* summary = nullptr);
+
+// Inverse of adding splines on a previously spline-free frame: clears kSplines,
+// removes LF-global spline entropy between the parsed region bounds, and
+// schedules the same splice machinery as |ApplySplinesFromFile|. Fails when the
+// frame had no spline entropy span or stripped TOC permutation with spline
+// edits.
+// If |exact_forward_body_delta_bits| is non-null, it must be the positive
+// |spline_edit_delta_bits| from the matching forward |ApplySplinesFromFile| on
+// this frame (body growth in bits, multiple of 8); removal uses |-value| so the
+// written body length matches the encoder's forward padding choice.
+bool ApplyRemoveSplinesAddOnly(ParsedCodestream* cs, size_t frame_index,
+                               const int64_t* exact_forward_body_delta_bits =
+                                   nullptr);
+
+// Clears splines on each listed codestream frame index (same constraints as
+// |ApplyRemoveSplinesAddOnly|). Indices need not be sorted.
+bool ApplyClearSplinesOnFrames(ParsedCodestream* cs,
+                               const std::vector<size_t>& frame_indices);
+
+// After |ApplyRemoveSplinesAddOnly| in the same pass, shrink the physical TOC
+// stream slot that carries logical LF-global (section 0) by |trim_bytes|
+// (1..255). Used when spline insert/remove left extra all-zero tail bytes vs
+// the reference codestream so |WriteCodestream| matches pre-edit bytes.
+// Requires |fu.spline_edit| with an empty mid from the clear step.
+bool ApplyLfGlobalPhysicalChunk0TailTrim(ParsedCodestream* cs, size_t frame_index,
+                                         uint8_t trim_bytes);
+
+// Compares LF-global physical chunk0 between |long_*| and |ref_*| for
+// |frame_index|. If |long| equals |ref| followed by 1..255 trailing 0x00 bytes
+// only, returns that count; otherwise 0.
+uint8_t ComputeLfGlobalChunk0TailPaddingTrimBytes(
+    const uint8_t* long_cs, size_t long_sz, const ParsedCodestream& long_parsed,
+    const uint8_t* ref_cs, size_t ref_sz, const ParsedCodestream& ref_parsed,
+    size_t frame_index);
 
 // Set UTF-8 frame name bytes (|name_utf8|) on regular / skip-progressive
 // frames. Indices are codestream indices after any other transforms applied
@@ -153,6 +227,21 @@ bool ApplySetFrameNames(
     ParsedCodestream* cs,
     const std::vector<std::pair<size_t, std::vector<uint8_t>>>&
         frame_index_name);
+
+// When |ApplyKeepListedFrames| is a full permutation (every codestream frame
+// index 0..n-1 appears exactly once), optional |undo_out| records enough to
+// invert the reorder and restore |is_last| / |save_as_reference|.
+struct KeepReorderUndoSpec {
+  std::vector<size_t> forward_order;
+  std::vector<std::pair<bool, uint32_t>> tail_before;
+  void clear() {
+    forward_order.clear();
+    tail_before.clear();
+  }
+};
+
+bool ApplyKeepListedFramesReorderInverse(ParsedCodestream* cs,
+                                         const KeepReorderUndoSpec& undo);
 
 // Keep only the listed codestream frames, in the order given (first mention
 // wins; duplicate indices are skipped). Verbatim frame bytes are
@@ -164,9 +253,12 @@ bool ApplySetFrameNames(
 // Returns false if an index is out of range or the tail constraint fails.
 // |out_changed| is set when the frame list or any |is_last| / save_as_reference
 // field changed relative to a full identity keep 0..n-1 (optional).
+// |undo_out|: when non-null and the keep is a full bijective reorder, filled for
+// |ApplyKeepListedFramesReorderInverse| / --check_reversible.
 bool ApplyKeepListedFrames(ParsedCodestream* cs,
                            const std::vector<size_t>& frames_in_order,
-                           bool* out_changed = nullptr);
+                           bool* out_changed = nullptr,
+                           KeepReorderUndoSpec* undo_out = nullptr);
 
 // Blend override for one codestream frame (regular / skip-progressive only).
 // |mode| is always applied (0–4 or spec slug at CLI). Optional fields are applied
@@ -198,6 +290,12 @@ bool RemapFrameBlendOverridesForKeepOrder(
 bool ApplyFrameBlendOverrides(
     ParsedCodestream* cs,
     const std::vector<FrameBlendOverride>& overrides);
+
+// Restores blending fields verbatim (for lossless undo of --set-frame-blends).
+bool ApplyFrameBlendExactRestore(ParsedCodestream* cs, size_t frame_index,
+                                 const FrameBlendingInfo& main,
+                                 const std::vector<FrameBlendingInfo>& ec,
+                                 uint32_t save_as_reference);
 
 // |frame_index_duration|: (codestream frame index, duration in ticks). Only
 // when the image has animation; only regular / skip-progressive frames.

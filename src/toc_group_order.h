@@ -29,6 +29,27 @@ enum class TocGroupOrderCli {
 bool TocStreamOrderLooksProgressive(const FramedUnit& fu,
                                     const FrameTocMetrics& tm);
 
+struct FramedUnitTocSnapshot {
+  size_t frame_index = 0;
+  std::vector<uint32_t> toc_decoded_sizes;
+  std::vector<uint32_t> toc_perm;
+  size_t toc_bits_before_sizes = 0;
+  bool toc_strip_perm_reorder = false;
+  std::vector<uint32_t> toc_strip_stream_sizes;
+  std::vector<size_t> toc_strip_logical_to_stream;
+  std::vector<size_t> toc_body_stream_shuffle;
+  std::vector<uint32_t> toc_body_shuffle_src_sizes;
+};
+
+void CopyFramedUnitTocSnapshot(const FramedUnit& fu, FramedUnitTocSnapshot* snap);
+void RestoreFramedUnitTocSnapshot(const FramedUnitTocSnapshot& snap, FramedUnit* fu);
+
+// Eligible VarDCT / skip-progressive frames with multi-entry TOC (same filter as
+// ApplyTocGroupOrder). Populates |out_snaps| in codestream frame order.
+bool CaptureTocSnapshotsBeforeGroupOrder(const ParsedCodestream& cs,
+                                         const std::vector<size_t>* only_frames,
+                                         std::vector<FramedUnitTocSnapshot>* out_snaps);
+
 // Applies |order| to eligible frames (optionally restricted by |only_frames|).
 // kCanonical strips permutation; kProgressive strips only when not
 // TocStreamOrderLooksProgressive. kCenterFirst reorders stream-order TOC sections
