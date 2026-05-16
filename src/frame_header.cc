@@ -1058,7 +1058,16 @@ bool ReadFrameTOC(BitReader& br, const FrameHeader& fh,
     *frame_data_bytes = total;
     if (fu != nullptr) {
       fu->toc_decoded_sizes = std::move(sizes);
-      fu->toc_perm = std::move(perm);
+      if (!perm.empty()) {
+        std::vector<uint32_t> logical_at_stream;
+        if (!TocPermLogicalAtStreamFromLehmerNaturalToStream(perm, n,
+                                                             &logical_at_stream)) {
+          return false;
+        }
+        fu->toc_perm = std::move(logical_at_stream);
+      } else {
+        fu->toc_perm.clear();
+      }
       fu->toc_bit_length = toc_bits;
     }
   }

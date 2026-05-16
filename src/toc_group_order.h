@@ -22,7 +22,7 @@ struct FrameTocMetrics;
 enum class TocGroupOrderCli {
   kKeep,
   kCanonical,    // 0: strip TOC permutation (logical stream order)
-  kCenterFirst,  // 1: not implemented (requires permutation entropy encode)
+  kCenterFirst,  // 1: center-first AC group order (matches cjxl --group_order=1)
   kProgressive,  // normalize only when HF data appears before all LF groups
 };
 
@@ -31,7 +31,8 @@ bool TocStreamOrderLooksProgressive(const FramedUnit& fu,
 
 // Applies |order| to eligible frames (optionally restricted by |only_frames|).
 // kCanonical strips permutation; kProgressive strips only when not
-// TocStreamOrderLooksProgressive. kCenterFirst is rejected (not implemented).
+// TocStreamOrderLooksProgressive. kCenterFirst reorders stream-order TOC sections
+// to libjxl center-first layout (see |center_x| / |center_y|, default image center).
 // When |any_mutation| is non-null, sets *any_mutation true if any frame was
 // modified.
 bool ApplyTocGroupOrder(ParsedCodestream* cs, TocGroupOrderCli order,

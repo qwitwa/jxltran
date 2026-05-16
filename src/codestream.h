@@ -106,6 +106,13 @@ struct FramedUnit {
   // and rewrites the TOC without permutation (e.g. --group_order=0 or
   // progressive normalization).
   bool toc_strip_perm_reorder = false;
+
+  // Center-first (--group_order=1): body bytes are permuted in stream order.
+  // |toc_body_stream_shuffle[s]| is the source stream-slot index (sizes in
+  // |toc_body_shuffle_src_sizes|) whose section is written at new stream slot s
+  // after |toc_decoded_sizes| / |toc_perm| were updated. Empty = disabled.
+  std::vector<size_t> toc_body_stream_shuffle;
+  std::vector<uint32_t> toc_body_shuffle_src_sizes;
 };
 
 struct ParsedCodestream {

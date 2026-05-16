@@ -1295,6 +1295,56 @@ bool ApplyFrameBlendOverrides(ParsedCodestream* cs,
   return true;
 }
 
+bool RemapFrameBlendOverridesForKeepOrder(
+    const std::vector<size_t>& frames_in_order, const size_t num_frames_before,
+    std::vector<FrameBlendOverride>* overrides) {
+  if (overrides == nullptr) return false;
+  std::vector<size_t> order;
+  order.reserve(frames_in_order.size());
+  for (size_t idx : frames_in_order) {
+    if (idx >= num_frames_before) {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends remap: keep-list index %" PRIuS " out "
+              "of range (codestream had %" PRIuS " frames before keep)\n",
+              idx, num_frames_before);
+      return false;
+    }
+    bool seen = false;
+    for (size_t prior : order) {
+      if (prior == idx) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) order.push_back(idx);
+  }
+  std::vector<size_t> old_to_new(num_frames_before,
+                                 std::numeric_limits<size_t>::max());
+  for (size_t j = 0; j < order.size(); ++j) {
+    old_to_new[order[j]] = j;
+  }
+  for (FrameBlendOverride& o : *overrides) {
+    if (o.frame_index >= num_frames_before) {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends: frame index %" PRIuS " out of range "
+              "for keep remap (codestream had %" PRIuS " frames before keep)\n",
+              o.frame_index, num_frames_before);
+      return false;
+    }
+    const size_t ni = old_to_new[o.frame_index];
+    if (ni == std::numeric_limits<size_t>::max()) {
+      fprintf(stderr,
+              "jxltran: --set-frame-blends: frame %" PRIuS " is not in the "
+              "--keep-listed-frames keep list (cannot apply blend after "
+              "reorder)\n",
+              o.frame_index);
+      return false;
+    }
+    o.frame_index = ni;
+  }
+  return true;
+}
+
 bool ApplyFrameDurationOverrides(
     ParsedCodestream* cs,
     const std::vector<std::pair<size_t, uint32_t>>& frame_index_duration) {

@@ -1386,19 +1386,15 @@ static bool ParseGroupOrder(const char* s, jxltran::TocGroupOrderCli* out) {
     return true;
   }
   if (strcmp(s, "1") == 0) {
-    fprintf(stderr,
-            "jxltran: --group_order=1 is not implemented yet (requires "
-            "reordering frame body bytes to match a new TOC permutation).\n");
-    return false;
+    *out = jxltran::TocGroupOrderCli::kCenterFirst;
+    return true;
   }
   if (strcmp(s, "progressive") == 0) {
     *out = jxltran::TocGroupOrderCli::kProgressive;
     return true;
   }
   fprintf(stderr,
-          "jxltran: --group_order expects keep|0|progressive (1 not yet "
-          "supported), got '%s'\n",
-          s);
+          "jxltran: --group_order expects keep|0|1|progressive, got '%s'\n", s);
   return false;
 }
 
@@ -1847,32 +1843,34 @@ struct Args {
     cmdline->AddHelpText(
         "\nCodestream signal (TOC, noise, filtering, splines):", 0);
     cmdline->AddOptionValue(
-        '\0', "group_order", "keep|0|progressive",
+        '\0', "group_order", "keep|0|1|progressive",
         "TOC section order in regular / skip-progressive frames.\n"
         "    keep         : leave permutation and sizes unchanged.\n"
         "    0            : strip TOC permutation (logical order in the "
         "bitstream).\n"
+        "    1            : center-first AC group order (matches cjxl "
+        "--group_order=1; rewrites\n"
+        "                   stream-order section bytes and the TOC permutation).\n"
         "    progressive  : if stream order is non-progressive (HF spatial "
         "groups appear\n"
         "                   before lf_global and every lf_group have been "
         "signaled),\n"
         "                   strip permutation like 0; otherwise keep (e.g. "
         "center-first\n"
-        "                   order that still signals all LF data before HF). "
-        "--group_order=1\n"
-        "                   is not implemented yet.",
+        "                   order that still signals all LF data before HF).",
         &group_order, ParseGroupOrder);
     cmdline->AddOptionValue(
         '\0', "center_x", "X",
-        "With --group_order=1 (not implemented), image X coordinate for "
-        "spiral center\n"
-        "(-1 = image center, matching cjxl). Ignored for other modes.",
+        "With --group_order=1, image X coordinate (pixels) for the center used "
+        "to pick the\n"
+        "starting side of the center-first spiral (-1 = image center, matching "
+        "cjxl). Ignored for other modes.",
         &center_x, ParseCenterI64);
     cmdline->AddOptionValue(
         '\0', "center_y", "Y",
-        "With --group_order=1 (not implemented), image Y coordinate for "
-        "spiral center\n"
-        "(-1 = image center). Ignored for other modes.",
+        "With --group_order=1, image Y coordinate for the spiral center (-1 = "
+        "image center).\n"
+        "Ignored for other modes.",
         &center_y, ParseCenterI64);
     cmdline->AddOptionValue(
         '\0', "set-photon-noise-iso", "ISO",
@@ -2653,15 +2651,6 @@ int main(int argc, const char* argv[]) {
         }
         if (epf_u_changed) wrote_anything = true;
       }
-      if (args.group_order != jxltran::TocGroupOrderCli::kKeep) {
-        bool toc_changed = false;
-        if (!jxltran::ApplyTocGroupOrder(&parsed, args.group_order, args.center_x,
-                                        args.center_y, frame_sel,
-                                        &toc_changed)) {
-          return false;
-        }
-        if (toc_changed) wrote_anything = true;
-      }
       if (args.NeedsSplinesSet()) {
         if (!jxltran::ApplySplinesFromFile(&parsed, args.set_splines_from,
                                            frame_sel)) {
@@ -2676,7 +2665,42 @@ int main(int argc, const char* argv[]) {
         }
         wrote_anything = true;
       }
-      if (args.NeedsSetFrameBlends()) {
+      if (args.group_order != jxltran::TocGroupOrderCli::kKeep) {
+        bool toc_changed = false;
+        if (!jxltran::ApplyTocGroupOrder(&parsed, args.group_order, args.center_x,
+                                        args.center_y, frame_sel,
+                                        &toc_changed)) {
+          return false;
+        }
+        if (toc_changed) wrote_anything = true;
+      }
+      const std::vector<size_t>& keep_order_sel =
+          args.keep_frames.set ? args.keep_frames.indices_ordered
+                               : args.frames.indices_ordered;
+      const bool keep_and_blends =
+          args.NeedsKeepListedFrames() && args.NeedsSetFrameBlends();
+      bool did_early_keep_for_blends = false;
+      if (keep_and_blends) {
+        const size_t n_before_keep = parsed.frames.size();
+        bool keep_changed = false;
+        if (!jxltran::ApplyKeepListedFrames(&parsed, keep_order_sel,
+                                             &keep_changed)) {
+          return false;
+        }
+        if (keep_changed) wrote_anything = true;
+        std::vector<jxltran::FrameBlendOverride> blend_ov =
+            args.set_frame_blends.overrides;
+        if (!jxltran::RemapFrameBlendOverridesForKeepOrder(
+                keep_order_sel, n_before_keep, &blend_ov)) {
+          return false;
+        }
+        if (!jxltran::ApplyFrameBlendOverrides(&parsed, blend_ov)) {
+          return false;
+        }
+        wrote_anything = true;
+        did_early_keep_for_blends = true;
+      }
+      if (args.NeedsSetFrameBlends() && !did_early_keep_for_blends) {
         if (!jxltran::ApplyFrameBlendOverrides(&parsed,
                                               args.set_frame_blends.overrides)) {
           return false;
@@ -2690,12 +2714,10 @@ int main(int argc, const char* argv[]) {
         }
         wrote_anything = true;
       }
-      if (args.NeedsKeepListedFrames()) {
+      if (args.NeedsKeepListedFrames() && !did_early_keep_for_blends) {
         bool keep_changed = false;
-        const std::vector<size_t>& keep_order =
-            args.keep_frames.set ? args.keep_frames.indices_ordered
-                                 : args.frames.indices_ordered;
-        if (!jxltran::ApplyKeepListedFrames(&parsed, keep_order, &keep_changed)) {
+        if (!jxltran::ApplyKeepListedFrames(&parsed, keep_order_sel,
+                                            &keep_changed)) {
           return false;
         }
         if (keep_changed) wrote_anything = true;

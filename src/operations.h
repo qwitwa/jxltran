@@ -187,6 +187,14 @@ struct FrameBlendOverride {
 // Optional fields are applied as given when set_* is true (no range checks
 // against num_extra or mode; invalid combinations may confuse decoders).
 // target= sets save_as_reference (0–3) only when the frame is not last.
+//
+// |frame_index| values are codestream indices before --keep-listed-frames.
+// When both keep and blend overrides are used in one run, jxltran applies
+// keep first and remaps overrides via RemapFrameBlendOverridesForKeepOrder so
+// ApplyKeepListedFrames does not clobber blend edits.
+bool RemapFrameBlendOverridesForKeepOrder(
+    const std::vector<size_t>& frames_in_order, size_t num_frames_before,
+    std::vector<FrameBlendOverride>* overrides);
 bool ApplyFrameBlendOverrides(
     ParsedCodestream* cs,
     const std::vector<FrameBlendOverride>& overrides);

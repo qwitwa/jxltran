@@ -44,6 +44,18 @@ bool WriteDecodedToc(BitWriter& bw, size_t header_bits_mod8,
                      const std::vector<uint32_t>& perm,
                      const std::vector<uint32_t>& sizes);
 
+// Internal jxltran representation: |logical_at_stream[s]| is the logical TOC
+// section index carried in stream-order slot |s| (matches libjxl dec_frame
+// after grouping). The bitstream Lehmer code stores the inverse mapping
+// |natural_to_stream[L]| = stream slot of logical section |L|, as in libjxl
+// enc_frame WriteGroupOffsets / PermuteGroups.
+bool TocPermLogicalAtStreamFromLehmerNaturalToStream(
+    const std::vector<uint32_t>& natural_to_stream, size_t n,
+    std::vector<uint32_t>* logical_at_stream_out);
+bool TocPermLehmerNaturalToStreamFromLogicalAtStream(
+    const std::vector<uint32_t>& logical_at_stream, size_t n,
+    std::vector<uint32_t>* natural_to_stream_out);
+
 // Writes only the U32-encoded section sizes and final byte padding (same as
 // the tail of ReadFullToc after the permutation prefix).
 bool WriteTocSizeList(BitWriter& bw, const std::vector<uint32_t>& sizes);

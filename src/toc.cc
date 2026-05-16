@@ -309,6 +309,42 @@ bool ReadToc(BitReader& br, size_t toc_entries, uint64_t* total) {
   return ReadFullToc(br, toc_entries, total, nullptr, nullptr, nullptr);
 }
 
+bool TocPermLogicalAtStreamFromLehmerNaturalToStream(
+    const std::vector<uint32_t>& natural_to_stream, size_t n,
+    std::vector<uint32_t>* logical_at_stream_out) {
+  logical_at_stream_out->clear();
+  if (natural_to_stream.empty()) return true;
+  if (natural_to_stream.size() != n) return false;
+  logical_at_stream_out->assign(n, 0);
+  std::vector<bool> seen(n, false);
+  for (size_t L = 0; L < n; ++L) {
+    const uint32_t s = natural_to_stream[L];
+    if (static_cast<size_t>(s) >= n) return false;
+    if (seen[s]) return false;
+    seen[s] = true;
+    (*logical_at_stream_out)[s] = static_cast<uint32_t>(L);
+  }
+  return true;
+}
+
+bool TocPermLehmerNaturalToStreamFromLogicalAtStream(
+    const std::vector<uint32_t>& logical_at_stream, size_t n,
+    std::vector<uint32_t>* natural_to_stream_out) {
+  natural_to_stream_out->clear();
+  if (logical_at_stream.empty()) return true;
+  if (logical_at_stream.size() != n) return false;
+  natural_to_stream_out->assign(n, 0);
+  std::vector<bool> seen(n, false);
+  for (size_t s = 0; s < n; ++s) {
+    const uint32_t L = logical_at_stream[s];
+    if (static_cast<size_t>(L) >= n) return false;
+    if (seen[L]) return false;
+    seen[L] = true;
+    (*natural_to_stream_out)[L] = static_cast<uint32_t>(s);
+  }
+  return true;
+}
+
 bool WriteDecodedToc(BitWriter& bw, size_t /*header_bits_mod8*/,
                      const std::vector<uint32_t>& perm_u32,
                      const std::vector<uint32_t>& sizes_u32) {

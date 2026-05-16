@@ -281,6 +281,43 @@ static bool ConcatLogicalOrderBody(const std::vector<std::vector<uint8_t>>& chun
   return true;
 }
 
+static bool BuildTocShuffleBody(const FramedUnit& fu, const uint8_t* orig,
+                                size_t orig_size, size_t body_src_abs_bit,
+                                std::vector<uint8_t>* out) {
+  const auto& shuffle = fu.toc_body_stream_shuffle;
+  const auto& src_sz = fu.toc_body_shuffle_src_sizes;
+  const size_t n = fu.toc_decoded_sizes.size();
+  if (shuffle.size() != n || src_sz.size() != n) {
+    return false;
+  }
+  std::vector<std::vector<uint8_t>> chunks;
+  if (!ExtractStreamOrderBodyChunks(orig, orig_size, body_src_abs_bit, src_sz,
+                                    &chunks)) {
+    fprintf(stderr, "jxltran: TOC shuffle: failed to read original body\n");
+    return false;
+  }
+  if (chunks.size() != n) {
+    return false;
+  }
+  out->clear();
+  for (size_t new_s = 0; new_s < n; ++new_s) {
+    const size_t old_s = shuffle[new_s];
+    if (old_s >= chunks.size()) {
+      return false;
+    }
+    const std::vector<uint8_t>& ch = chunks[old_s];
+    out->insert(out->end(), ch.begin(), ch.end());
+  }
+  if (out->size() * 8u != fu.body_bit_length) {
+    fprintf(stderr,
+            "jxltran: TOC shuffle: output body %" PRIuS " bytes != expected %" PRIuS
+            "\n",
+            out->size(), static_cast<size_t>(fu.body_bit_length / 8u));
+    return false;
+  }
+  return true;
+}
+
 // Rebuild frame body in logical TOC order and optionally splice photon-noise
 // 80 bits inside the LF-global section (arbitrary bit phase).
 static bool BuildStripPermPhotonBody(const FramedUnit& fu, const uint8_t* orig,
@@ -404,6 +441,27 @@ static bool BuildPhotonStreamOrderBody(const FramedUnit& fu, const uint8_t* orig
 }
 
 }  // namespace
+
+// |fu.toc_perm| is logical section index at each stream slot (decoder-style A).
+// WriteDecodedToc expects on-disk Lehmer P: stream slot of each logical section.
+static bool WriteDecodedTocFromFuLogicalAtStreamPerm(
+    BitWriter& bw, const size_t header_bits_mod8,
+    const std::vector<uint32_t>& logical_at_stream,
+    const std::vector<uint32_t>& sizes) {
+  if (logical_at_stream.empty()) {
+    return WriteDecodedToc(bw, header_bits_mod8, logical_at_stream, sizes);
+  }
+  std::vector<uint32_t> natural_to_stream;
+  if (!TocPermLehmerNaturalToStreamFromLogicalAtStream(logical_at_stream,
+                                                       sizes.size(),
+                                                       &natural_to_stream)) {
+    fprintf(stderr,
+            "jxltran: internal error: could not invert TOC permutation for "
+            "re-encode (logical-at-stream -> natural-to-stream)\n");
+    return false;
+  }
+  return WriteDecodedToc(bw, header_bits_mod8, natural_to_stream, sizes);
+}
 
 bool ReadCodestream(const uint8_t* data, size_t size, ParsedCodestream* out) {
   // Reset the full struct so a reused |out| cannot retain stale image metadata
@@ -636,6 +694,7 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
     const size_t phase_out = bw.bit_pos() % 8u;
     const size_t phase_in = (frame_bit_base + toc_rel) % 8u;
     const bool strip_body = fu.toc_strip_perm_reorder;
+    const bool shuffle_body = !fu.toc_body_stream_shuffle.empty();
     const bool spline_toc =
         fu.spline_edit && fu.spline_edit_toc_reencode;
     const bool spline_body_delta_no_perm =
@@ -644,8 +703,8 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
     const bool photon_toc =
         fu.photon_noise_edit && fu.photon_noise_toc_reencode;
     const bool need_toc_rewrite =
-        strip_body || photon_toc || spline_toc || spline_body_delta_no_perm ||
-        (phase_out != phase_in);
+        strip_body || shuffle_body || photon_toc || spline_toc ||
+        spline_body_delta_no_perm || (phase_out != phase_in);
     if (TraceIsOn()) {
       TraceWriteField(bw.bit_pos(), "write.frame.splice_toc_bits",
                       "src_start_bit=%" PRIuS " count=%" PRIuS " reencode=%d",
@@ -654,7 +713,7 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
     }
     const bool perm_nonempty = !fu.toc_perm.empty();
     const bool can_partial_toc =
-        !strip_body && perm_nonempty && need_toc_rewrite &&
+        !strip_body && !shuffle_body && perm_nonempty && need_toc_rewrite &&
         fu.toc_bits_before_sizes > 0 &&
         fu.toc_bits_before_sizes <= fu.toc_bit_length;
 
@@ -668,6 +727,13 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
                             fu.toc_decoded_sizes)) {
           fprintf(stderr,
                   "jxltran: failed to re-encode TOC (strip permutation)\n");
+          return false;
+        }
+      } else if (shuffle_body) {
+        if (!WriteDecodedTocFromFuLogicalAtStreamPerm(
+                bw, toc_phase, fu.toc_perm, fu.toc_decoded_sizes)) {
+          fprintf(stderr,
+                  "jxltran: failed to re-encode TOC (center-first / shuffle)\n");
           return false;
         }
       } else if (!perm_nonempty) {
@@ -687,7 +753,8 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
           return false;
         }
       } else {
-        if (!WriteDecodedToc(bw, toc_phase, fu.toc_perm, fu.toc_decoded_sizes)) {
+        if (!WriteDecodedTocFromFuLogicalAtStreamPerm(
+                bw, toc_phase, fu.toc_perm, fu.toc_decoded_sizes)) {
           fprintf(stderr,
                   "jxltran: failed to re-encode TOC (with permutation)\n");
           return false;
@@ -706,6 +773,18 @@ bool WriteCodestream(const ParsedCodestream& cs, const uint8_t* original,
       std::vector<uint8_t> new_body;
       if (!BuildStripPermPhotonBody(fu, original, orig_cs_size, body_src_abs_bit,
                                     &new_body)) {
+        return false;
+      }
+      if ((bw.bit_pos() & 7u) != 0u) {
+        fprintf(stderr,
+                "jxltran: internal error: body not byte-aligned after TOC\n");
+        return false;
+      }
+      bw.AppendRawBytes(new_body.data(), new_body.size());
+    } else if (shuffle_body) {
+      std::vector<uint8_t> new_body;
+      if (!BuildTocShuffleBody(fu, original, orig_cs_size, body_src_abs_bit,
+                               &new_body)) {
         return false;
       }
       if ((bw.bit_pos() & 7u) != 0u) {
