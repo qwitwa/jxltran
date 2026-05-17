@@ -1558,6 +1558,7 @@ struct Args {
   const char* file_in = nullptr;
   const char* file_out = nullptr;
   bool info = false;
+  bool info_structure = false;
   ContainerOpt container = ContainerOpt::kAsIs;
   JxlpOpt jxlp = JxlpOpt::kAsIs;
   uint32_t strip = 0;
@@ -1659,8 +1660,8 @@ struct Args {
                                  "The JPEG XL input file.", &file_in);
     cmdline->AddPositionalOption(
         "OUTPUT", /*required=*/false,
-        "The JPEG XL output file (omit with --info, --extract-*, and other "
-        "read-only modes).",
+        "The JPEG XL output file (omit with --info, --info-structure, "
+        "--extract-*, and other read-only modes).",
         &file_out);
     cmdline->AddHelpText("\nInspect and extract (no OUTPUT file):", 0);
     cmdline->AddOptionFlag(
@@ -1670,6 +1671,13 @@ struct Args {
         "orientation as dimensions), then exit. No OUTPUT file; cannot be "
         "combined with transform or remux options.",
         &info, &jpegxl::tools::SetBooleanTrue);
+    cmdline->AddOptionFlag(
+        '\0', "info-structure",
+        "Print one JSON object with BMFF box byte spans, codestream fragment "
+        "mapping, and per-frame header / TOC / body / TOC-section layout "
+        "(codestream byte offsets), then exit. No OUTPUT file; same "
+        "combination rules as --info (cannot be combined with --info).",
+        &info_structure, &jpegxl::tools::SetBooleanTrue);
     cmdline->AddOptionValue(
         '\0', "extract-icc", "FILE",
         "Write the codestream-embedded ICC profile to FILE (when present) and "
@@ -2512,24 +2520,33 @@ int main(int argc, const char* argv[]) {
             "--set-orientation-relative\n");
     return 1;
   }
-  if ((args.info || args.extract_icc || args.extract_splines || meta_extract) &&
+  if (args.info && args.info_structure) {
+    fprintf(stderr,
+            "jxltran: use only one of --info and --info-structure.\n");
+    return 1;
+  }
+  if ((args.info || args.info_structure || args.extract_icc ||
+        args.extract_splines || meta_extract) &&
       args.file_out) {
     fprintf(stderr,
-            "jxltran: --info and --extract-* options do not take an output file; "
-            "omit OUTPUT.\n");
+            "jxltran: --info, --info-structure, and --extract-* options do not "
+            "take an output file; omit OUTPUT.\n");
     return 1;
   }
-  if ((args.info || args.extract_icc || args.extract_splines || meta_extract) &&
+  if ((args.info || args.info_structure || args.extract_icc ||
+        args.extract_splines || meta_extract) &&
       InfoModeUsesNonDefaultOptions(args)) {
     fprintf(stderr,
-            "jxltran: --info and --extract-* cannot be combined with other "
-            "options (only optional -v/--verbose).\n");
+            "jxltran: --info, --info-structure, and --extract-* cannot be "
+            "combined with other options (only optional -v/--verbose).\n");
     return 1;
   }
-  if (meta_set && (args.info || args.extract_icc || meta_extract)) {
+  if (meta_set &&
+      (args.info || args.info_structure || args.extract_icc || meta_extract)) {
     fprintf(stderr,
             "jxltran: --set-exif/--set-xmp/--set-jumbf cannot be combined with "
-            "--info, --extract-icc, or --extract-exif/xmp/jumbf.\n");
+            "--info, --info-structure, --extract-icc, or --extract-exif/xmp/"
+            "jumbf.\n");
     return 1;
   }
   if (meta_set && !args.file_out) {
@@ -2556,8 +2573,8 @@ int main(int argc, const char* argv[]) {
     return 1;
   }
 
-  if (!args.info && !args.file_out && !args.extract_icc &&
-      !args.extract_splines && !meta_extract) {
+  if (!args.info && !args.info_structure && !args.file_out &&
+      !args.extract_icc && !args.extract_splines && !meta_extract) {
     fprintf(stderr, "No output file specified.\n");
     return 1;
   }
@@ -2610,14 +2627,16 @@ int main(int argc, const char* argv[]) {
     is_container = true;
   }
 
-  if (args.info || args.extract_icc || args.extract_splines || meta_extract) {
+  if (args.info || args.info_structure || args.extract_icc ||
+      args.extract_splines || meta_extract) {
     if (meta_extract && !input_was_container) {
       fprintf(stderr,
               "jxltran: --extract-exif, --extract-xmp, and --extract-jumbf "
               "require a JXL container input.\n");
       return 1;
     }
-    if (args.info || args.extract_icc || args.extract_splines) {
+    if (args.info || args.info_structure || args.extract_icc ||
+        args.extract_splines) {
       std::vector<uint8_t> cs;
       if (input_was_container) {
         if (!jxltran::ReassembleCodestream(boxes, &cs)) return 1;
@@ -2653,6 +2672,11 @@ int main(int argc, const char* argv[]) {
         }
         std::vector<uint8_t> bytes(text.begin(), text.end());
         if (!WriteFile(args.extract_splines, bytes)) return 1;
+      }
+      if (args.info_structure) {
+        jxltran::PrintBitstreamStructureJson(
+            stdout, input.data(), input.size(), boxes, input_was_container,
+            parsed, cs.size());
       }
       if (args.info) {
         PrintJxlInfoStdout(parsed);

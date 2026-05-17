@@ -74,6 +74,9 @@ bool ParseBoxes(const uint8_t* buf, size_t size, std::vector<JxlBox>* out) {
     }
     JxlBox box;
     memcpy(box.type, type_ptr, 4);
+    box.file_offset = pos;
+    box.file_total_bytes = static_cast<size_t>(box_size);
+    box.header_size = static_cast<uint8_t>(header_size);
     box.data.assign(buf + pos + header_size,
                     buf + pos + header_size + data_size);
     out->push_back(std::move(box));

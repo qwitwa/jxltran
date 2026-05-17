@@ -21,6 +21,12 @@ namespace jxltran {
 struct JxlBox {
   char type[4];
   std::vector<uint8_t> data;
+  // Filled by ParseBoxes: absolute byte offset of the box size field in the
+  // file, total serialized box length (header + payload), and header length
+  // (8 or 16 when size field uses extended 64-bit form).
+  size_t file_offset = 0;
+  size_t file_total_bytes = 0;
+  uint8_t header_size = 8;
 };
 
 // Parses all top-level ISOBMFF boxes from |buf|[0..|size|).

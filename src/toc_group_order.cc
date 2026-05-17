@@ -246,45 +246,65 @@ static bool ApplyCenterFirstOnFrame(FramedUnit* fu, const FrameTocMetrics& tm,
     return true;
   }
 
-  std::vector<size_t> dest_to_src(n, n);
-  for (size_t src = 0; src < n; ++src) {
-    const size_t d = perm_move[src];
-    if (d >= n || dest_to_src[d] != n) {
+  // |perm_move[L]| = target stream slot for canonical logical section L (LF
+  // global, LF groups, HF global, then AC groups in center-first order per
+  // pass). Invert: |logical_at_target_stream[new_s]| = L.
+  std::vector<size_t> logical_at_target_stream(n, n);
+  for (size_t logical = 0; logical < n; ++logical) {
+    const size_t d = perm_move[logical];
+    if (d >= n || logical_at_target_stream[d] != n) {
       fprintf(stderr, "jxltran: --group_order=1: invalid move permutation\n");
       return false;
     }
-    dest_to_src[d] = src;
+    logical_at_target_stream[d] = logical;
   }
 
+  const std::vector<uint32_t> src_sizes = fu->toc_decoded_sizes;
+  const std::vector<uint32_t> old_perm = fu->toc_perm;
+  auto old_stream_for_logical = [&](size_t logical) -> size_t {
+    if (old_perm.empty()) {
+      return logical;
+    }
+    for (size_t s = 0; s < old_perm.size(); ++s) {
+      if (static_cast<size_t>(old_perm[s]) == logical) {
+        return s;
+      }
+    }
+    return n;
+  };
+
+  std::vector<size_t> shuffle(n, n);
   bool identity_shuffle = true;
-  for (size_t i = 0; i < n; ++i) {
-    if (dest_to_src[i] != i) {
+  for (size_t new_s = 0; new_s < n; ++new_s) {
+    const size_t logical = logical_at_target_stream[new_s];
+    if (logical >= n) {
+      fprintf(stderr, "jxltran: --group_order=1: invalid move permutation\n");
+      return false;
+    }
+    const size_t old_s = old_stream_for_logical(logical);
+    if (old_s >= n) {
+      fprintf(stderr,
+              "jxltran: --group_order=1: could not map logical %" PRIuS
+              " to a stream slot\n",
+              logical);
+      return false;
+    }
+    shuffle[new_s] = old_s;
+    if (old_s != new_s) {
       identity_shuffle = false;
-      break;
     }
   }
   if (identity_shuffle) {
     return true;
   }
 
-  const std::vector<uint32_t> src_sizes = fu->toc_decoded_sizes;
-  const std::vector<uint32_t> old_perm = fu->toc_perm;
-  auto logical_at_stream = [&](size_t stream_slot) -> size_t {
-    if (old_perm.empty()) {
-      return stream_slot;
-    }
-    if (stream_slot >= old_perm.size()) {
-      return stream_slot;
-    }
-    return static_cast<size_t>(old_perm[stream_slot]);
-  };
-
   std::vector<uint32_t> new_perm(n, 0);
   std::vector<uint32_t> new_sizes(n, 0);
   for (size_t new_s = 0; new_s < n; ++new_s) {
-    const size_t old_s = dest_to_src[new_s];
+    const size_t logical = logical_at_target_stream[new_s];
+    const size_t old_s = shuffle[new_s];
     new_sizes[new_s] = src_sizes[old_s];
-    new_perm[new_s] = static_cast<uint32_t>(logical_at_stream(old_s));
+    new_perm[new_s] = static_cast<uint32_t>(logical);
   }
 
   fu->toc_decoded_sizes = std::move(new_sizes);
@@ -301,7 +321,7 @@ static bool ApplyCenterFirstOnFrame(FramedUnit* fu, const FrameTocMetrics& tm,
             "source codestream (pending photon/spline LF-global edit?)\n");
     return false;
   }
-  fu->toc_body_stream_shuffle = std::move(dest_to_src);
+  fu->toc_body_stream_shuffle = std::move(shuffle);
   if (mutated != nullptr) {
     *mutated = true;
   }
