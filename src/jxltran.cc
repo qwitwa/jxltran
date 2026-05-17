@@ -2802,12 +2802,13 @@ int main(int argc, const char* argv[]) {
     const bool meta_set_cur = args.set_exif != nullptr ||
                                args.set_xmp != nullptr ||
                                args.set_jumbf != nullptr;
-    const bool append_any = args.append_jxl != nullptr || args.append_dummy_tail;
     if (!jxltran::ArgsBoxPipelineReversibleForUndo(
             args.strip != 0, args.jxlp != JxlpOpt::kAsIs,
             args.box_order.order != jxltran::BoxOrder::kAsIs,
-            args.brob.mode != jxltran::BrobOpt::kAsIs, append_any, meta_set_cur)) {
-      undo_rec.SetBoxPipelineNotReversible("strip/jxlp/box-order/brob/append/metadata");
+            args.brob.mode != jxltran::BrobOpt::kAsIs,
+            args.append_jxl != nullptr, meta_set_cur)) {
+      undo_rec.SetBoxPipelineNotReversible(
+          "strip/jxlp/box-order/brob/append-jxl/metadata");
     }
     if (args.NeedsClearSplinesFrames() && !args.NeedsLfGlobalChunk0TailTrim()) {
       undo_rec.SetCodestreamNotReversible(

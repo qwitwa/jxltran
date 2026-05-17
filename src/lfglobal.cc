@@ -280,7 +280,7 @@ static bool DecodeQuantizedSpline(BitReader& br, EntropyCoder& ec,
   if (!decode_dct(&spline->sigma_dct)) {
     return false;
   }
-  return br.ok();
+  return true;
 }
 
 bool DecodeSplinesBundle(BitReader& br, size_t num_pixels,

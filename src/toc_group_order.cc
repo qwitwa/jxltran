@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <numeric>
 #include <utility>
@@ -23,6 +24,49 @@ namespace {
 static size_t AcGroupIndex(size_t pass, size_t group, size_t num_groups,
                            size_t num_dc_groups) {
   return 2 + num_dc_groups + pass * num_groups + group;
+}
+
+// Stream-order slot index carrying logical TOC section 0 (LF-global).
+static bool StreamSlotOfLogicalLfGlobal(const FramedUnit& fu, size_t* p0) {
+  if (fu.toc_decoded_sizes.empty()) return false;
+  if (fu.toc_perm.empty()) {
+    *p0 = 0;
+    return true;
+  }
+  for (size_t p = 0; p < fu.toc_perm.size(); ++p) {
+    if (fu.toc_perm[p] == 0) {
+      *p0 = p;
+      return true;
+    }
+  }
+  return false;
+}
+
+// |post_edit| matches |original| body layout except LF-global stream slot |p0|,
+// which |fu| may have grown/shrunk for pending photon or spline edits (same-run
+// metadata updates before WriteCodestream rewrites the body).
+static bool ShuffleBodyStreamSizesAsInOriginal(const FramedUnit& fu,
+                                               const std::vector<uint32_t>& post_edit,
+                                               std::vector<uint32_t>* out) {
+  *out = post_edit;
+  if (out->empty()) return true;
+  size_t p0 = 0;
+  if (!StreamSlotOfLogicalLfGlobal(fu, &p0) || p0 >= out->size()) {
+    return false;
+  }
+  int64_t pending = 0;
+  if (fu.photon_noise_edit) {
+    pending += static_cast<int64_t>(fu.photon_noise_delta_bytes);
+  }
+  if (fu.spline_edit && fu.spline_edit_delta_bits != 0) {
+    if (fu.spline_edit_delta_bits % 8 != 0) return false;
+    pending += static_cast<int64_t>(fu.spline_edit_delta_bits / 8);
+  }
+  if (pending == 0) return true;
+  const int64_t v = static_cast<int64_t>((*out)[p0]) - pending;
+  if (v < 0 || v > static_cast<int64_t>(UINT32_MAX)) return false;
+  (*out)[p0] = static_cast<uint32_t>(v);
+  return true;
 }
 
 static bool InvertStreamPermutation(const std::vector<uint32_t>& perm,
@@ -250,7 +294,13 @@ static bool ApplyCenterFirstOnFrame(FramedUnit* fu, const FrameTocMetrics& tm,
   fu->toc_strip_stream_sizes.clear();
   fu->toc_strip_logical_to_stream.clear();
 
-  fu->toc_body_shuffle_src_sizes = src_sizes;
+  if (!ShuffleBodyStreamSizesAsInOriginal(*fu, src_sizes,
+                                           &fu->toc_body_shuffle_src_sizes)) {
+    fprintf(stderr,
+            "jxltran: --group_order=1: could not derive stream chunk sizes from "
+            "source codestream (pending photon/spline LF-global edit?)\n");
+    return false;
+  }
   fu->toc_body_stream_shuffle = std::move(dest_to_src);
   if (mutated != nullptr) {
     *mutated = true;

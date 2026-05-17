@@ -355,13 +355,35 @@ static bool BuildTocShuffleBody(const FramedUnit& fu, const uint8_t* orig,
   if (chunks.size() != n) {
     return false;
   }
-  out->clear();
+  std::vector<std::vector<uint8_t>> new_chunks;
+  new_chunks.reserve(n);
   for (size_t new_s = 0; new_s < n; ++new_s) {
     const size_t old_s = shuffle[new_s];
     if (old_s >= chunks.size()) {
       return false;
     }
-    const std::vector<uint8_t>& ch = chunks[old_s];
+    new_chunks.emplace_back(chunks[old_s]);
+  }
+  if (fu.photon_noise_edit) {
+    size_t p0 = 0;
+    if (!PhysicalStreamIndexForLogical0(fu, &p0) || p0 >= new_chunks.size()) {
+      fprintf(stderr,
+              "jxltran: TOC shuffle: invalid TOC for photon noise splice\n");
+      return false;
+    }
+    const size_t noise_rel = PhotonNoiseRelInLfSection(fu, body_src_abs_bit);
+    const int64_t db = fu.photon_noise_delta_bytes;
+    std::vector<uint8_t> patched;
+    if (!SpliceLfPhotonNoise(new_chunks[p0], noise_rel, db,
+                             fu.photon_noise_new_bytes, &patched)) {
+      fprintf(stderr,
+              "jxltran: TOC shuffle: photon noise LF-global splice failed\n");
+      return false;
+    }
+    new_chunks[p0] = std::move(patched);
+  }
+  out->clear();
+  for (const auto& ch : new_chunks) {
     out->insert(out->end(), ch.begin(), ch.end());
   }
   if (out->size() * 8u != fu.body_bit_length) {

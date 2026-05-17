@@ -229,9 +229,12 @@ class UndoRecorder {
 // True when box-level options do not drop or rewrite container bytes in a way
 // that --check_reversible cannot validate from primary codestream equality alone.
 // (--container no/yes/if-needed alone is OK: primary codestream bytes match.)
+// --append-dummy-tail is excluded: it only extends the primary codestream before
+// transforms, same as other codestream edits. --append-jxl is not: it merges
+// arbitrary external codestream bytes.
 bool ArgsBoxPipelineReversibleForUndo(bool strip_nonzero, bool jxlp_non_keep,
                                       bool box_order_non_keep, bool brob_non_keep,
-                                      bool append_any, bool meta_set_any);
+                                      bool append_jxl, bool meta_set_any);
 
 }  // namespace jxltran
 

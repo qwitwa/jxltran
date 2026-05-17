@@ -30,6 +30,7 @@ set(JXLTRAN_SOURCES
   "${JXLTRAN_SRC_DIR}/lfglobal.cc"
   "${JXLTRAN_SRC_DIR}/jxltran.cc"
   "${JXLTRAN_SRC_DIR}/orientation_compose.cc"
+  "${JXLTRAN_SRC_DIR}/reversible_undo.cc"
   "${JXLTRAN_SRC_DIR}/photon_noise.cc"
   "${JXLTRAN_SRC_DIR}/operations.cc"
   "${JXLTRAN_SRC_DIR}/opsin_adjust.cc"

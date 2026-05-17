@@ -39,12 +39,14 @@ struct HuffEntry {
   uint16_t value;
 };
 
-// ANS alias-table entry.  freq = D[symbol] (the probability count).
+// ANS alias-table entry (matches lib/jxl/ans_common.h AliasTable::Entry layout
+// for decoding). freq0 is D[i]; freq1_xor_freq0 is D[right_value] ^ D[i].
 struct AliasEntry {
-  uint16_t symbol;
+  uint16_t symbol;  // right_value (secondary symbol index in this bucket)
   uint16_t cutoff;
   uint32_t offset;
-  uint32_t freq;
+  uint16_t freq0;
+  uint16_t freq1_xor_freq0;
 };
 
 // One probability distribution (ANS or prefix-code).
@@ -469,11 +471,14 @@ static const uint8_t kLogcountHuff[128][2] = {
     {3, 10}, {4, 4},  {3, 7}, {4, 1}, {3, 6}, {3, 8}, {3, 9}, {4, 2},
 };
 
-// PopCount precision (mirrors GetPopulationCountPrecision from libjxl).
-static int PopPrecision(int logcount, int shift) {
-  int r = std::min(logcount,
-                   shift - (static_cast<int>(kANSLogTabSize) - logcount) / 2);
-  return r < 0 ? 0 : r;
+// PopCount precision (matches lib/jxl/ans_common.h GetPopulationCountPrecision).
+static int PopPrecision(uint32_t logcount, uint32_t shift) {
+  int32_t r = std::min<int32_t>(
+      static_cast<int32_t>(logcount),
+      static_cast<int32_t>(shift) -
+          static_cast<int32_t>((kANSLogTabSize - logcount) >> 1));
+  if (r < 0) return 0;
+  return static_cast<int>(r);
 }
 
 static bool ReadANSDist(BitReader& br, std::vector<int32_t>* counts) {
@@ -575,7 +580,8 @@ static bool ReadANSDist(BitReader& br, std::vector<int32_t>* counts) {
       if (shift == 0 || code == 0) {
         (*counts)[i] = 1 << code;
       } else {
-        int bc = PopPrecision(code, shift);
+        int bc = PopPrecision(static_cast<uint32_t>(code),
+                              static_cast<uint32_t>(shift));
         (*counts)[i] = (1 << code) +
                        (static_cast<int32_t>(br.ReadBits(bc)) << (code - bc));
       }
@@ -625,9 +631,13 @@ static bool BuildAliasTable(const std::vector<int32_t>& counts, int log_alpha,
 
   if (nonzero == 1) {
     for (int i = 0; i < table_size; ++i) {
-      (*alias)[i] = {static_cast<uint16_t>(nz_sym), 0,
+      const uint32_t f0 = 0;
+      const uint32_t f1 = static_cast<uint32_t>(c[nz_sym]);
+      (*alias)[i] = {static_cast<uint16_t>(nz_sym),
+                     0,
                      static_cast<uint32_t>(bucket_size * i),
-                     static_cast<uint32_t>(c[nz_sym])};
+                     static_cast<uint16_t>(f0),
+                     static_cast<uint16_t>(f1 ^ f0)};
     }
     return true;
   }
@@ -666,9 +676,15 @@ static bool BuildAliasTable(const std::vector<int32_t>& counts, int log_alpha,
       cut[i] = 0;
     } else
       off[i] -= cut[i];
+    const uint32_t f0 =
+        (i < static_cast<int>(c.size())) ? static_cast<uint32_t>(c[i]) : 0u;
+    const int i1 = sym[i];
+    const uint32_t f1 = (i1 >= 0 && i1 < static_cast<int>(c.size()))
+                            ? static_cast<uint32_t>(c[i1])
+                            : 0u;
     (*alias)[i] = {static_cast<uint16_t>(sym[i]), static_cast<uint16_t>(cut[i]),
-                   static_cast<uint32_t>(off[i]),
-                   static_cast<uint32_t>(c[sym[i]])};
+                   static_cast<uint32_t>(off[i]), static_cast<uint16_t>(f0),
+                   static_cast<uint16_t>(f1 ^ f0)};
   }
   return true;
 }
@@ -684,10 +700,23 @@ static uint32_t DecodeANSSym(BitReader& br, uint32_t* state,
   int i = static_cast<int>(res >> log_bucket);
   uint32_t pos = res & ((1u << log_bucket) - 1);
   const AliasEntry& e = d.alias[i];
-  uint32_t sym = (pos >= e.cutoff) ? e.symbol : static_cast<uint32_t>(i);
+  uint32_t sym = (pos >= e.cutoff) ? static_cast<uint32_t>(e.symbol)
+                                   : static_cast<uint32_t>(i);
   uint32_t off = (pos >= e.cutoff) ? e.offset + pos : pos;
-  *state = e.freq * (*state >> kANSLogTabSize) + off;
-  if (*state < (1u << 16)) *state = (*state << 16) | br.ReadBits(16);
+  const uint32_t freq1_xor_use =
+      (pos >= e.cutoff) ? static_cast<uint32_t>(e.freq1_xor_freq0) : 0u;
+  const uint32_t freq =
+      static_cast<uint32_t>(e.freq0) ^ freq1_xor_use;
+  *state = freq * (*state >> kANSLogTabSize) + off;
+  // Match libjxl ANSSymbolReader::ReadSymbolANSWithoutRefill (branchless
+  // normalize): peek 16 bits every step; consume them iff state < 2^16.
+  const uint32_t new_state =
+      (*state << 16u) | static_cast<uint32_t>(br.PeekBits(16));
+  const bool normalize = *state < (1u << 16u);
+  *state = normalize ? new_state : *state;
+  if (normalize) {
+    br.Consume(16);
+  }
   return sym;
 }
 
@@ -1257,7 +1286,13 @@ uint32_t DecodeHybridUint(BitReader& br, EntropyCoder& ec, size_t ctx) {
 
 bool FinalizeEntropyCoder(EntropyCoder& ec) {
   auto* st = static_cast<CoderState*>(ec.internal);
-  if (!st->use_prefix && st->ans_state != kANSFinalState) return false;
+  if (!st->use_prefix && st->ans_state != kANSFinalState) {
+    EntropyTrace("FinalizeEntropyCoder bad ANS state=0x%08X want 0x%08X",
+                 st->ans_state, kANSFinalState);
+    delete st;
+    ec.internal = nullptr;
+    return false;
+  }
   delete st;
   ec.internal = nullptr;
   return true;

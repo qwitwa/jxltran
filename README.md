@@ -120,7 +120,7 @@ Edits to **per-frame** codestream fields: blend parameters, animation tick durat
 |--------|----------|----------------|
 | `--set-frame-blends` | `SPEC[,SPEC…]` | Per-frame blend overrides (`INDEX:MODE` and optional fields). |
 | `--set-frame-durations` | `INDEX:TICKS[,…]` | Set animation tick duration per frame. |
-| `--set-frame-names` | `INDEX:HEX[,…]` | Set or clear per-frame name bytes (UTF-8 as hex, same encoding as **`--info`**). |
+| `--set-frame-names` | `INDEX:VALUE[,…]` | Set or clear per-frame name bytes: `VALUE` is even-length hex (as in **`--info`** `name_hex=`), an unquoted literal when it is not even-length all-hex (no spaces), or a double-quoted literal for spaces and similar (`\\`, `\"` inside quotes); `INDEX:` alone clears. |
 | `--set-frame-region` | `INDEX:WxH+X+Y[,…]` | Move a frame’s display rectangle (same oriented space as **`--info`** / **`--crop`**); size unchanged. |
 | `--gab-blur` | `A` | Reversible Gaborish blur (`A` ≥ 0); mutually exclusive with other **`--gab-*`**. |
 | `--gab-sharpen` | `A` | Reversible Gaborish sharpen; mutually exclusive with other **`--gab-*`**. |

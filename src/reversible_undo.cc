@@ -1160,9 +1160,9 @@ ReversibleCheckStatus UndoRecorder::VerifyRoundtripCodestream(
 
 bool ArgsBoxPipelineReversibleForUndo(bool strip_nonzero, bool jxlp_non_keep,
                                       bool box_order_non_keep, bool brob_non_keep,
-                                      bool append_any, bool meta_set_any) {
+                                      bool append_jxl, bool meta_set_any) {
   return !strip_nonzero && !jxlp_non_keep && !box_order_non_keep &&
-         !brob_non_keep && !append_any && !meta_set_any;
+         !brob_non_keep && !append_jxl && !meta_set_any;
 }
 
 }  // namespace jxltran
