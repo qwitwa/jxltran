@@ -65,6 +65,21 @@ struct LfGlobalThroughNoise {
   // When kFrameFlagNoise, the verbatim 80-bit LUT read from the bitstream.
   bool noise_lut_bytes_valid = false;
   std::array<uint8_t, 10> noise_lut_bytes{};
+
+  // DequantMatrices::DecodeDC immediately after the noise block (or noise
+  // insert point): 1-bit all_default, or 0 + 3×F16 wire values (pre-×1/128).
+  size_t dc_quant_start_bit = 0;
+  size_t dc_quant_end_bit = 0;
+  bool dc_quant_all_default = true;
+  std::array<uint16_t, 3> dc_quant_f16_bits{};
+
+  // VarDCT only: QuantizerParams bundle (libjxl Quantizer::Decode) immediately
+  // after the LF dequant region — global_scale U32 then quant_dc U32.
+  bool quantizer_parsed = false;
+  size_t quantizer_start_bit = 0;
+  size_t quantizer_end_bit = 0;
+  uint32_t quantizer_global_scale = 0;
+  uint32_t quantizer_quant_dc = 0;
 };
 
 bool DecodeSplinesBundle(BitReader& br, size_t num_pixels,
@@ -72,9 +87,9 @@ bool DecodeSplinesBundle(BitReader& br, size_t num_pixels,
 
 // |br| must be sized to the LF-global section bytes only (first TOC entry when
 // present). Advances |br| past patches, splines, and the 80-bit noise LUT when
-// kNoise; leaves |br| at the first bit after the noise block (or at noise
-// insert point when !kNoise). On success, fills |out| and |br.pos()| is the
-// post-noise bit index within the section.
+// kNoise; leaves |br| at the first bit after the LF channel dequantization
+// bundle (DecodeDC). On success, fills |out| and |br.pos()| is the first bit
+// after that bundle within the section.
 bool ReadLfGlobalThroughNoise(
     BitReader& br, const FrameHeader& fh, const ImageMetadata& meta,
     uint32_t canvas_w, uint32_t canvas_h,

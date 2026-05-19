@@ -433,6 +433,35 @@ bool ReadLfGlobalThroughNoise(
     }
   }
 
+  out->dc_quant_start_bit = br.pos();
+  const uint32_t all_default_dc = br.ReadBits(1);
+  if (!br.ok()) return false;
+  out->dc_quant_all_default = (all_default_dc != 0);
+  if (!out->dc_quant_all_default) {
+    for (int c = 0; c < 3; ++c) {
+      out->dc_quant_f16_bits[static_cast<size_t>(c)] =
+          static_cast<uint16_t>(br.ReadF16());
+      if (!br.ok()) return false;
+    }
+  } else {
+    out->dc_quant_f16_bits.fill(0);
+  }
+  out->dc_quant_end_bit = br.pos();
+
+  out->quantizer_parsed = false;
+  if (fh.encoding != kFrameEncModular) {
+    out->quantizer_start_bit = br.pos();
+    out->quantizer_global_scale =
+        ReadU32(br, U32Dist::BitsOffset(11, 1), U32Dist::BitsOffset(11, 2049),
+                 U32Dist::BitsOffset(12, 4097), U32Dist::BitsOffset(16, 8193));
+    out->quantizer_quant_dc =
+        ReadU32(br, U32Dist::Imm(16), U32Dist::BitsOffset(5, 1),
+                 U32Dist::BitsOffset(8, 1), U32Dist::BitsOffset(16, 1));
+    if (!br.ok()) return false;
+    out->quantizer_end_bit = br.pos();
+    out->quantizer_parsed = true;
+  }
+
   return br.ok();
 }
 

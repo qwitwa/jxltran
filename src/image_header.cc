@@ -435,13 +435,13 @@ static bool ReadExtraChannelInfo(BitReader& br, ExtraChannelInfo* ec) {
       ec->alpha_associated = br.ReadBool();
     }
   }
-  if (ec->type == ExtraChannelType::kSpotColour) {
+  if (!ec->d_alpha && ec->type == ExtraChannelType::kSpotColour) {
     ec->spot_red = br.ReadF16();
     ec->spot_green = br.ReadF16();
     ec->spot_blue = br.ReadF16();
     ec->spot_solidity = br.ReadF16();
   }
-  if (ec->type == ExtraChannelType::kCFA) {
+  if (!ec->d_alpha && ec->type == ExtraChannelType::kCFA) {
     ec->cfa_channel =
         ReadU32(br, U32Dist::Imm(1), U32Dist::Bits(2),
                 U32Dist::BitsOffset(4, 3), U32Dist::BitsOffset(8, 19));
@@ -464,13 +464,13 @@ static void WriteExtraChannelInfo(BitWriter& bw, const ExtraChannelInfo& ec) {
       bw.WriteBool(ec.alpha_associated);
     }
   }
-  if (ec.type == ExtraChannelType::kSpotColour) {
+  if (!ec.d_alpha && ec.type == ExtraChannelType::kSpotColour) {
     bw.WriteF16(ec.spot_red);
     bw.WriteF16(ec.spot_green);
     bw.WriteF16(ec.spot_blue);
     bw.WriteF16(ec.spot_solidity);
   }
-  if (ec.type == ExtraChannelType::kCFA) {
+  if (!ec.d_alpha && ec.type == ExtraChannelType::kCFA) {
     WriteU32(bw, ec.cfa_channel, U32Dist::Imm(1), U32Dist::Bits(2),
              U32Dist::BitsOffset(4, 3), U32Dist::BitsOffset(8, 19));
   }

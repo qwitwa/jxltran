@@ -99,6 +99,35 @@ struct FramedUnit {
   size_t lf_global_spline_rel_end_bit = 0;
   // Decoded splines when the bitstream contained a spline bundle at read time.
   std::optional<LfGlobalSplines> lf_global_splines;
+
+  // LF channel dequantization (libjxl DequantMatrices::DecodeDC) after noise in
+  // logical LF-global section 0. Filled when LF-global prefix parse succeeds.
+  bool lf_global_dc_quant_parsed = false;
+  size_t lf_global_dc_quant_rel_region_start = 0;
+  size_t lf_global_dc_quant_rel_region_old_len_bits = 0;
+  bool lf_global_dc_quant_all_default = true;
+  std::array<uint16_t, 3> lf_global_dc_quant_f16_bits{};
+  bool lf_global_dc_quant_edit = false;
+  int32_t lf_global_dc_quant_delta_bytes = 0;
+  bool lf_global_dc_quant_toc_reencode = false;
+  std::vector<uint8_t> lf_global_dc_quant_new_region_bits;
+  size_t lf_global_dc_quant_new_region_len_bits = 0;
+
+  // VarDCT: QuantizerParams (global_scale, quant_dc) after LF dequant in
+  // LF-global section 0. Filled when LF-global prefix parse succeeds.
+  bool lf_global_quantizer_parsed = false;
+  size_t lf_global_quantizer_rel_region_start = 0;
+  size_t lf_global_quantizer_rel_region_old_len_bits = 0;
+  uint32_t lf_global_quantizer_global_scale = 0;
+  uint32_t lf_global_quantizer_quant_dc = 0;
+  bool lf_global_quantizer_edit = false;
+  int32_t lf_global_quantizer_delta_bytes = 0;
+  bool lf_global_quantizer_toc_reencode = false;
+  std::vector<uint8_t> lf_global_quantizer_new_region_bits;
+  size_t lf_global_quantizer_new_region_len_bits = 0;
+  // Zero-bits appended after the LF-global chunk0 tail when replacing the
+  // quantizer bundle if (new_len - old_len) mod 8 != 0 (chunk0 stays byte-sized).
+  uint8_t lf_global_quantizer_tail_pad_bits = 0;
   // Re-encoded spline entropy (LF-global bit range); see ApplySplinesFromFile.
   bool spline_edit = false;
   int64_t spline_edit_delta_bits = 0;

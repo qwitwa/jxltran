@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <limits>
 #include <numeric>
 #include <string>
@@ -32,6 +33,7 @@
 #include "opsin_adjust.h"
 #include "orientation_compose.h"
 #include "printf_macros.h"
+#include "restoration_filter.h"
 #include "spline_io.h"
 #include "toc_group_order.h"
 #include "toc_layout.h"
@@ -379,6 +381,31 @@ static bool ParseOpsinHueOpt(const char* s, OpsinFloatOpt* out) {
   return ParseOpsinSlider(s, out, "--opsin-hue", -100.f, 100.f);
 }
 
+static bool ParseOpsinBiasXOpt(const char* s, OpsinFloatOpt* out) {
+  return ParseOpsinSlider(s, out, "--opsin-bias-x", -0.003f, 0.003f);
+}
+
+static bool ParseOpsinBiasYOpt(const char* s, OpsinFloatOpt* out) {
+  return ParseOpsinSlider(s, out, "--opsin-bias-y", -0.003f, 0.003f);
+}
+
+static bool ParseOpsinBiasBOpt(const char* s, OpsinFloatOpt* out) {
+  return ParseOpsinSlider(s, out, "--opsin-bias-b", -0.03f, 0.03f);
+}
+
+static bool ParseOpsinQuantBias0Opt(const char* s, OpsinFloatOpt* out) {
+  return ParseOpsinSlider(s, out, "--opsin-quant-bias-0", -20.f, 20.f);
+}
+static bool ParseOpsinQuantBias1Opt(const char* s, OpsinFloatOpt* out) {
+  return ParseOpsinSlider(s, out, "--opsin-quant-bias-1", -20.f, 20.f);
+}
+static bool ParseOpsinQuantBias2Opt(const char* s, OpsinFloatOpt* out) {
+  return ParseOpsinSlider(s, out, "--opsin-quant-bias-2", -20.f, 20.f);
+}
+static bool ParseOpsinQuantBias3Opt(const char* s, OpsinFloatOpt* out) {
+  return ParseOpsinSlider(s, out, "--opsin-quant-bias-3", -20.f, 20.f);
+}
+
 struct NumLoopsArg {
   bool set = false;
   uint32_t value = 0;
@@ -390,6 +417,42 @@ static bool ParseNumLoopsOpt(const char* s, NumLoopsArg* out) {
   if (*end != '\0' || v < 0) {
     fprintf(stderr,
             "--set-num-loops: expected a non-negative integer, got '%s'\n", s);
+    return false;
+  }
+  out->set = true;
+  out->value = static_cast<uint32_t>(v);
+  return true;
+}
+
+struct MainFloatArg {
+  bool set = false;
+  uint32_t value = 0;  // 0 or 1
+};
+
+static bool ParseMainFloatOpt(const char* s, MainFloatArg* out) {
+  char* end;
+  unsigned long v = strtoul(s, &end, 10);
+  if (end == s || *end != '\0' || (v != 0 && v != 1)) {
+    fprintf(stderr,
+            "jxltran: --set-main-float: expected 0 or 1, got '%s'\n", s);
+    return false;
+  }
+  out->set = true;
+  out->value = static_cast<uint32_t>(v);
+  return true;
+}
+
+struct MainExpArg {
+  bool set = false;
+  uint32_t value = 5;
+};
+
+static bool ParseMainExpOpt(const char* s, MainExpArg* out) {
+  char* end;
+  unsigned long v = strtoul(s, &end, 10);
+  if (end == s || *end != '\0' || v < 2 || v > 8) {
+    fprintf(stderr,
+            "jxltran: --set-main-exp: expected integer 2..8, got '%s'\n", s);
     return false;
   }
   out->set = true;
@@ -464,6 +527,46 @@ static bool ParseTpsOpt(const char* s, TpsArg* out) {
   out->relative_percent = false;
   out->numerator = static_cast<uint32_t>(num);
   out->denominator = static_cast<uint32_t>(den);
+  return true;
+}
+
+struct IntensityTargetArg {
+  bool set = false;
+  bool to_default_bundle = false;
+  float nits = 0.f;
+};
+
+static bool ParseIntensityTargetOpt(const char* s, IntensityTargetArg* out) {
+  if (s == nullptr || *s == '\0') {
+    fprintf(stderr, "jxltran: --set-intensity-target: empty value\n");
+    return false;
+  }
+  if (strcasecmp(s, "default") == 0) {
+    out->set = true;
+    out->to_default_bundle = true;
+    out->nits = 0.f;
+    return true;
+  }
+  char* end = nullptr;
+  const float v = strtof(s, &end);
+  if (end == s || *end != '\0') {
+    fprintf(stderr,
+            "jxltran: --set-intensity-target: expected a finite number > 0 "
+            "(nits) or 'default', got '%s'\n",
+            s);
+    return false;
+  }
+  if (!std::isfinite(v) || !(v > 0.f)) {
+    fprintf(stderr,
+            "jxltran: --set-intensity-target: value must be finite and > 0; "
+            "use 'default' for the implicit default tone-mapping bundle, got "
+            "'%s'\n",
+            s);
+    return false;
+  }
+  out->set = true;
+  out->to_default_bundle = false;
+  out->nits = v;
   return true;
 }
 
@@ -700,6 +803,82 @@ static bool ParsePhotonIsoOpt(const char* s, PhotonIsoArg* out) {
   }
   out->set = true;
   out->iso = v;
+  return true;
+}
+
+struct LfDcQuantMulArg {
+  bool set = false;
+  float mx = 1.f;
+  float my = 1.f;
+  float mb = 1.f;
+};
+
+static bool ParseLfDcQuantMulOpt(const char* s, LfDcQuantMulArg* out) {
+  char* e1 = nullptr;
+  const double xd = std::strtod(s, &e1);
+  if (e1 == s || *e1 != ',') {
+    fprintf(stderr,
+            "jxltran: --lf-dc-quant-mul expects three comma-separated floats "
+            "(X,Y,B multipliers; 1 = unchanged), got '%s'\n",
+            s);
+    return false;
+  }
+  char* e2 = nullptr;
+  const double yd = std::strtod(e1 + 1, &e2);
+  if (e2 == e1 + 1 || *e2 != ',') {
+    fprintf(stderr,
+            "jxltran: --lf-dc-quant-mul expects three comma-separated floats "
+            "(X,Y,B multipliers; 1 = unchanged), got '%s'\n",
+            s);
+    return false;
+  }
+  char* e3 = nullptr;
+  const double bd = std::strtod(e2 + 1, &e3);
+  if (e3 == e2 + 1 || *e3 != '\0') {
+    fprintf(stderr,
+            "jxltran: --lf-dc-quant-mul expects three comma-separated floats "
+            "(X,Y,B multipliers; 1 = unchanged), got '%s'\n",
+            s);
+    return false;
+  }
+  const float x = static_cast<float>(xd);
+  const float y = static_cast<float>(yd);
+  const float b = static_cast<float>(bd);
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(b)) {
+    fprintf(stderr,
+            "jxltran: --lf-dc-quant-mul: each value must be finite, got '%s'\n", s);
+    return false;
+  }
+  if (x <= 0.f || y <= 0.f || b <= 0.f) {
+    fprintf(stderr,
+            "jxltran: --lf-dc-quant-mul: each value must be positive (decoder "
+            "rejects non-positive LF dequant), got '%s'\n",
+            s);
+    return false;
+  }
+  out->set = true;
+  out->mx = x;
+  out->my = y;
+  out->mb = b;
+  return true;
+}
+
+struct LfGlobalScaleArg {
+  bool set = false;
+  uint32_t value = 0;
+};
+
+static bool ParseLfGlobalScaleOpt(const char* s, LfGlobalScaleArg* out) {
+  char* end = nullptr;
+  unsigned long v = strtoul(s, &end, 10);
+  if (end == s || *end != '\0' || v < 1ul || v > 32768ul) {
+    fprintf(stderr,
+            "jxltran: --lf-global-scale expects an integer 1..32768, got '%s'\n",
+            s);
+    return false;
+  }
+  out->set = true;
+  out->value = static_cast<uint32_t>(v);
   return true;
 }
 
@@ -1554,6 +1733,273 @@ static bool ParseCenterI64(const char* s, int64_t* out) {
   return true;
 }
 
+static bool AppendSetExtraChannelSpec(const char* s,
+                                      std::vector<std::string>* out) {
+  if (s == nullptr || s[0] == '\0') {
+    fprintf(stderr,
+            "jxltran: --set-extra-channel expects INDEX:key=value,... (see "
+            "--help)\n");
+    return false;
+  }
+  out->push_back(s);
+  return true;
+}
+
+static bool ExtraChannelTypeFromSlug(const char* slug,
+                                     jxltran::ExtraChannelType* out) {
+  if (strcasecmp(slug, "alpha") == 0) {
+    *out = jxltran::ExtraChannelType::kAlpha;
+    return true;
+  }
+  if (strcasecmp(slug, "depth") == 0) {
+    *out = jxltran::ExtraChannelType::kDepth;
+    return true;
+  }
+  if (strcasecmp(slug, "spot") == 0) {
+    *out = jxltran::ExtraChannelType::kSpotColour;
+    return true;
+  }
+  if (strcasecmp(slug, "selection") == 0) {
+    *out = jxltran::ExtraChannelType::kSelectionMask;
+    return true;
+  }
+  if (strcasecmp(slug, "black") == 0) {
+    *out = jxltran::ExtraChannelType::kBlack;
+    return true;
+  }
+  if (strcasecmp(slug, "cfa") == 0) {
+    *out = jxltran::ExtraChannelType::kCFA;
+    return true;
+  }
+  if (strcasecmp(slug, "thermal") == 0) {
+    *out = jxltran::ExtraChannelType::kThermal;
+    return true;
+  }
+  if (strcasecmp(slug, "optional") == 0) {
+    *out = jxltran::ExtraChannelType::kOptional;
+    return true;
+  }
+  if (strcasecmp(slug, "nonoptional") == 0) {
+    *out = jxltran::ExtraChannelType::kNonOptional;
+    return true;
+  }
+  fprintf(stderr,
+          "jxltran: --set-extra-channel: unknown type '%s' (use alpha, depth, "
+          "spot, selection, black, cfa, thermal, optional, nonoptional)\n",
+          slug);
+  return false;
+}
+
+static bool ParseOneExtraChannelPatch(const char* spec,
+                                      jxltran::ExtraChannelHeaderPatch* p) {
+  *p = jxltran::ExtraChannelHeaderPatch{};
+  const char* colon = std::strchr(spec, ':');
+  if (colon == nullptr) {
+    fprintf(stderr,
+            "jxltran: --set-extra-channel: expected INDEX:key=value,... got "
+            "'%s'\n",
+            spec);
+    return false;
+  }
+  char* end = nullptr;
+  unsigned long idx = std::strtoul(spec, &end, 10);
+  if (end != colon) {
+    fprintf(stderr,
+            "jxltran: --set-extra-channel: bad channel index before ':' in "
+            "'%s'\n",
+            spec);
+    return false;
+  }
+  if (idx > static_cast<unsigned long>((std::numeric_limits<size_t>::max)())) {
+    fprintf(stderr, "jxltran: --set-extra-channel: index out of range\n");
+    return false;
+  }
+  p->index = static_cast<size_t>(idx);
+  const char* q = colon + 1;
+  while (*q != '\0') {
+    while (*q == ' ' || *q == '\t' || *q == ',') ++q;
+    if (*q == '\0') break;
+    const char* eq = std::strchr(q, '=');
+    if (eq == nullptr) {
+      fprintf(stderr,
+              "jxltran: --set-extra-channel: expected key=value in '%s'\n", spec);
+      return false;
+    }
+    std::string key(q, eq);
+    while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) {
+      key.pop_back();
+    }
+    const char* val = eq + 1;
+    const char* val_end = val;
+    while (*val_end != '\0' && *val_end != ',') ++val_end;
+    std::string v(val, val_end);
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) {
+      v.pop_back();
+    }
+    while (!v.empty() && (v[0] == ' ' || v[0] == '\t')) {
+      v.erase(v.begin());
+    }
+    q = val_end;
+    if (strcasecmp(key.c_str(), "dim_shift") == 0) {
+      fprintf(stderr,
+              "jxltran: --set-extra-channel: dim_shift cannot be changed "
+              "(per-channel subsampling is fixed in the codestream)\n");
+      return false;
+    }
+    if (strcasecmp(key.c_str(), "d_alpha") == 0) {
+      if (v != "0" && v != "1") {
+        fprintf(stderr,
+                "jxltran: --set-extra-channel: d_alpha must be 0 or 1\n");
+        return false;
+      }
+      p->set_d_alpha = true;
+      p->d_alpha = (v == "1");
+      continue;
+    }
+    if (strcasecmp(key.c_str(), "type") == 0) {
+      jxltran::ExtraChannelType t;
+      if (!ExtraChannelTypeFromSlug(v.c_str(), &t)) return false;
+      p->set_type = true;
+      p->type = t;
+      continue;
+    }
+    if (strcasecmp(key.c_str(), "bits") == 0) {
+      char* ve = nullptr;
+      unsigned long b = std::strtoul(v.c_str(), &ve, 10);
+      if (ve == v.c_str() || *ve != '\0' || b > 32u) {
+        fprintf(stderr,
+                "jxltran: --set-extra-channel: bits= expects integer 1..32\n");
+        return false;
+      }
+      p->set_ec_bits_per_sample = true;
+      p->bit_depth.bits_per_sample = static_cast<uint32_t>(b);
+      continue;
+    }
+    if (strcasecmp(key.c_str(), "float") == 0) {
+      if (v != "0" && v != "1") {
+        fprintf(stderr,
+                "jxltran: --set-extra-channel: float= must be 0 or 1\n");
+        return false;
+      }
+      p->set_ec_float_sample = true;
+      p->bit_depth.float_sample = (v == "1");
+      continue;
+    }
+    if (strcasecmp(key.c_str(), "exp") == 0) {
+      char* ve = nullptr;
+      unsigned long e = std::strtoul(v.c_str(), &ve, 10);
+      if (ve == v.c_str() || *ve != '\0' || e > 15u) {
+        fprintf(stderr,
+                "jxltran: --set-extra-channel: exp= expects small integer "
+                "(float exponent bits)\n");
+        return false;
+      }
+      p->set_ec_exp_bits = true;
+      p->bit_depth.exp_bits = static_cast<uint32_t>(e);
+      continue;
+    }
+    if (strcasecmp(key.c_str(), "assoc") == 0 ||
+        strcasecmp(key.c_str(), "alpha_associated") == 0) {
+      if (v != "0" && v != "1") {
+        fprintf(stderr,
+                "jxltran: --set-extra-channel: assoc= must be 0 or 1\n");
+        return false;
+      }
+      p->set_alpha_associated = true;
+      p->alpha_associated = (v == "1");
+      continue;
+    }
+    if (strcasecmp(key.c_str(), "name_hex") == 0) {
+      if ((v.size() % 2) != 0) {
+        fprintf(stderr,
+                "jxltran: --set-extra-channel: name_hex must have even length\n");
+        return false;
+      }
+      p->set_name = true;
+      p->name.clear();
+      for (size_t i = 0; i < v.size(); i += 2) {
+        const int hi = HexNibbleForFrameName(v[i]);
+        const int lo = HexNibbleForFrameName(v[i + 1]);
+        if (hi < 0 || lo < 0) {
+          fprintf(stderr,
+                  "jxltran: --set-extra-channel: invalid hex in name_hex\n");
+          return false;
+        }
+        p->name.push_back(static_cast<uint8_t>((hi << 4) | lo));
+      }
+      continue;
+    }
+    if (strcasecmp(key.c_str(), "cfa") == 0) {
+      char* ve = nullptr;
+      unsigned long c = std::strtoul(v.c_str(), &ve, 10);
+      if (ve == v.c_str() || *ve != '\0' || c == 0ul) {
+        fprintf(stderr, "jxltran: --set-extra-channel: cfa= expects uint >= 1\n");
+        return false;
+      }
+      p->set_cfa_channel = true;
+      p->cfa_channel = static_cast<uint32_t>(c);
+      continue;
+    }
+    if (strcasecmp(key.c_str(), "spot_r") == 0) {
+      char* ve = nullptr;
+      const double d = std::strtod(v.c_str(), &ve);
+      if (ve == v.c_str() || *ve != '\0' || !std::isfinite(d)) {
+        fprintf(stderr,
+                "jxltran: --set-extra-channel: spot_r= expects a finite float\n");
+        return false;
+      }
+      p->set_spot_r = true;
+      p->spot_r = static_cast<float>(d);
+      continue;
+    }
+    if (strcasecmp(key.c_str(), "spot_g") == 0) {
+      char* ve = nullptr;
+      const double d = std::strtod(v.c_str(), &ve);
+      if (ve == v.c_str() || *ve != '\0' || !std::isfinite(d)) {
+        fprintf(stderr,
+                "jxltran: --set-extra-channel: spot_g= expects a finite float\n");
+        return false;
+      }
+      p->set_spot_g = true;
+      p->spot_g = static_cast<float>(d);
+      continue;
+    }
+    if (strcasecmp(key.c_str(), "spot_b") == 0) {
+      char* ve = nullptr;
+      const double d = std::strtod(v.c_str(), &ve);
+      if (ve == v.c_str() || *ve != '\0' || !std::isfinite(d)) {
+        fprintf(stderr,
+                "jxltran: --set-extra-channel: spot_b= expects a finite float\n");
+        return false;
+      }
+      p->set_spot_b = true;
+      p->spot_b = static_cast<float>(d);
+      continue;
+    }
+    if (strcasecmp(key.c_str(), "spot_solidity") == 0 ||
+        strcasecmp(key.c_str(), "spot_a") == 0) {
+      char* ve = nullptr;
+      const double d = std::strtod(v.c_str(), &ve);
+      if (ve == v.c_str() || *ve != '\0' || !std::isfinite(d)) {
+        fprintf(stderr,
+                "jxltran: --set-extra-channel: %s= expects a finite float\n",
+                key.c_str());
+        return false;
+      }
+      p->set_spot_solidity = true;
+      p->spot_solidity = static_cast<float>(d);
+      continue;
+    }
+    fprintf(stderr,
+            "jxltran: --set-extra-channel: unknown key '%s' (keys: d_alpha, "
+            "type, bits, float, exp, assoc, name_hex, cfa, spot_r, spot_g, "
+            "spot_b, spot_solidity)\n",
+            key.c_str());
+    return false;
+  }
+  return true;
+}
+
 struct Args {
   const char* file_in = nullptr;
   const char* file_out = nullptr;
@@ -1566,13 +2012,24 @@ struct Args {
   BrobArg brob;
   uint32_t set_orientation = 0;      // 0 = no change; 1-8 = new orientation
   uint32_t rel_orientation = 0;    // 0 = no change; 1-8 = compose after current
-  uint32_t set_bits_per_sample = 0;  // 0 = no change; only for xyb_encoded
+  uint32_t set_bits_per_sample = 0;  // 0 = no change
+  MainFloatArg main_float;
+  MainExpArg main_exp;
   NumLoopsArg num_loops;
   TpsArg tps;
+  IntensityTargetArg intensity_target;
+  std::vector<std::string> set_extra_channel_specs;
   OpsinFloatOpt opsin_exposure;
   OpsinFloatOpt opsin_temperature;
   OpsinFloatOpt opsin_tint;
   OpsinFloatOpt opsin_hue;
+  OpsinFloatOpt opsin_bias_x;
+  OpsinFloatOpt opsin_bias_y;
+  OpsinFloatOpt opsin_bias_b;
+  OpsinFloatOpt opsin_quant_bias_0;
+  OpsinFloatOpt opsin_quant_bias_1;
+  OpsinFloatOpt opsin_quant_bias_2;
+  OpsinFloatOpt opsin_quant_bias_3;
   bool opsin_inverse = false;
   CropArg crop;
   FramesArg frames;
@@ -1587,6 +2044,8 @@ struct Args {
   int64_t center_y = -1;
   PhotonIsoArg photon_iso;
   const char* photon_weights = nullptr;
+  LfDcQuantMulArg lf_dc_quant_mul;
+  LfGlobalScaleArg lf_global_scale;
   EpfItersArg epf_iters;
   EpfAmpScaleArg epf_amp_scale;
   EpfUniformArg epf_uniform;
@@ -1617,12 +2076,20 @@ struct Args {
 
   bool NeedsHeaderMod() const {
     return set_orientation != 0 || rel_orientation != 0 ||
-           set_bits_per_sample != 0 || num_loops.set || tps.set;
+           set_bits_per_sample != 0 || main_float.set || main_exp.set ||
+           num_loops.set || tps.set ||
+           intensity_target.set || !set_extra_channel_specs.empty();
+  }
+
+  bool NeedsOpsinSliderArgs() const {
+    return opsin_exposure.set || opsin_temperature.set || opsin_tint.set ||
+           opsin_hue.set;
   }
 
   bool NeedsOpsinAdjust() const {
-    return opsin_exposure.set || opsin_temperature.set || opsin_tint.set ||
-           opsin_hue.set;
+    return NeedsOpsinSliderArgs() || opsin_bias_x.set || opsin_bias_y.set ||
+           opsin_bias_b.set || opsin_quant_bias_0.set || opsin_quant_bias_1.set ||
+           opsin_quant_bias_2.set || opsin_quant_bias_3.set;
   }
 
   bool NeedsPhotonNoiseIso() const { return photon_iso.set; }
@@ -1632,6 +2099,10 @@ struct Args {
   bool NeedsPhotonNoiseAny() const {
     return NeedsPhotonNoiseIso() || NeedsPhotonNoiseWeights();
   }
+
+  bool NeedsLfDcQuantMul() const { return lf_dc_quant_mul.set; }
+
+  bool NeedsLfGlobalScale() const { return lf_global_scale.set; }
 
   bool NeedsEpfIters() const { return epf_iters.set; }
 
@@ -1822,11 +2293,24 @@ struct Args {
         &rel_orientation, ParseOrientationOpt);
     cmdline->AddOptionValue(
         '\0', "set-bits-per-sample", "1..32",
-        "Set the bits_per_sample field in the image header.\n"
-        "Only valid for XYB-encoded images (xyb_encoded=true), where the\n"
-        "bit depth is metadata hinting the decoder about desired output\n"
-        "precision; it does not affect the compressed image data.",
+        "Set the bits_per_sample field in the image header (1..32).\n"
+        "For XYB-encoded images this is primarily a decoder output-precision\n"
+        "hint and does not change compressed XYB coefficients. For non-XYB\n"
+        "images it is part of the coded representation and may change decoded\n"
+        "samples when altered. Combine with --set-main-float and --set-main-exp\n"
+        "for float main samples.",
         &set_bits_per_sample, ParseBitsPerSampleOpt);
+    cmdline->AddOptionValue(
+        '\0', "set-main-float", "0|1",
+        "Set the main image header float_sample flag (0 = integer, 1 = float).\n"
+        "When set to 1, use --set-main-exp for exponent bits (2..8). Validates\n"
+        "the resulting BitDepth bundle like extra channels.",
+        &main_float, ParseMainFloatOpt);
+    cmdline->AddOptionValue(
+        '\0', "set-main-exp", "2..8",
+        "Set exponent bits for float main image samples (only meaningful when\n"
+        "float_sample is true).",
+        &main_exp, ParseMainExpOpt);
     cmdline->AddOptionValue(
         '\0', "set-num-loops", "N",
         "Set the animation loop count (0 = loop forever).\n"
@@ -1842,6 +2326,32 @@ struct Args {
         "            e.g. 50% for half speed, 200% for double.\n"
         "Only valid for animated images (have_animation=true).",
         &tps, ParseTpsOpt);
+    cmdline->AddOptionValue(
+        '\0', "set-intensity-target", "NITS|default",
+        "Set ToneMapping intensity_target (upper bound on scene intensity, in "
+        "nits).\n"
+        "    Pass 'default' to store the implicit default bundle (255 nits with "
+        "libjxl's other tone-mapping defaults), which omits an explicit "
+        "ToneMapping\n"
+        "    block when the rest of the header matches. If the image header is "
+        "packed\n"
+        "    (all_default), jxltran expands it in memory to decoder defaults so "
+        "this flag\n"
+        "    can still be applied.",
+        &intensity_target, ParseIntensityTargetOpt);
+    cmdline->AddOptionValue(
+        '\0', "set-extra-channel", "INDEX:key=val,...",
+        "Edit one ImageMetadata ExtraChannelInfo bundle (JPEG XL part1 image "
+        "header).\n"
+        "    Format: 0-based index, then comma-separated key=value pairs. Keys: "
+        "d_alpha (0|1 compact default-alpha),\n"
+        "    type (alpha|depth|spot|selection|black|cfa|thermal|optional|"
+        "nonoptional), bits, float (0|1), exp (float exponent bits),\n"
+        "    assoc / alpha_associated (0|1), name_hex (even hex UTF-8), cfa "
+        "(uint), spot_r, spot_g, spot_b, spot_solidity / spot_a.\n"
+        "    num_extra and dim_shift cannot be changed. Repeat the flag for "
+        "multiple channels.",
+        &set_extra_channel_specs, AppendSetExtraChannelSpec);
     cmdline->AddOptionValue(
         '\0', "opsin-exposure", "EV",
         "XYB only: exposure in stops (linear RGB after XYB→RGB). Reversible via\n"
@@ -1864,9 +2374,41 @@ struct Args {
         &opsin_tint, ParseOpsinTintOpt);
     cmdline->AddOptionValue(
         '\0', "opsin-hue", "T",
-        "XYB only: small hue rotation in the linear R–B plane, −100..+100 "
-        "(~±5° at extremes).",
+        "XYB only: HSL-like hue shift: rotate decoder linear RGB about Rec. 709 "
+        "luma,\n"
+        "    −100..+100 maps to −90°..+90° (avoids ±180° ambiguity).",
         &opsin_hue, ParseOpsinHueOpt);
+    cmdline->AddOptionValue(
+        '\0', "opsin-bias-x", "B",
+        "XYB only: add a delta to the X opsin bias field (CustomTransformData; "
+        "about −0.003..+0.003; small values have a large decoder effect).\n"
+        "    reversible_undo emits the additive inverse (implicit-default minus "
+        "stored F16) with --check_reversible.",
+        &opsin_bias_x, ParseOpsinBiasXOpt);
+    cmdline->AddOptionValue(
+        '\0', "opsin-bias-y", "D",
+        "XYB only: add a delta to the Y opsin bias field (about −0.003..+0.003).",
+        &opsin_bias_y, ParseOpsinBiasYOpt);
+    cmdline->AddOptionValue(
+        '\0', "opsin-bias-b", "D",
+        "XYB only: add a delta to the B opsin bias field (about −0.03..+0.03).",
+        &opsin_bias_b, ParseOpsinBiasBOpt);
+    cmdline->AddOptionValue(
+        '\0', "opsin-quant-bias-0", "D",
+        "XYB only: add a delta to quant_biases[0] (about −2..+2).",
+        &opsin_quant_bias_0, ParseOpsinQuantBias0Opt);
+    cmdline->AddOptionValue(
+        '\0', "opsin-quant-bias-1", "D",
+        "XYB only: add a delta to quant_biases[1] (about −2..+2).",
+        &opsin_quant_bias_1, ParseOpsinQuantBias1Opt);
+    cmdline->AddOptionValue(
+        '\0', "opsin-quant-bias-2", "D",
+        "XYB only: add a delta to quant_biases[2] (about −2..+2).",
+        &opsin_quant_bias_2, ParseOpsinQuantBias2Opt);
+    cmdline->AddOptionValue(
+        '\0', "opsin-quant-bias-3", "D",
+        "XYB only: add a delta to quant_biases[3] (about −2..+2).",
+        &opsin_quant_bias_3, ParseOpsinQuantBias3Opt);
     cmdline->AddOptionFlag(
         '\0', "opsin-inverse",
         "XYB only: apply the exact inverse of a prior opsin slider pass. Use the "
@@ -2081,6 +2623,23 @@ struct Args {
         "Mutually exclusive with --set-photon-noise-iso on the same run.",
         &photon_weights, StoreGabStringArg);
     cmdline->AddOptionValue(
+        '\0', "lf-dc-quant-mul", "X,Y,B",
+        "Multiply the three LF channel dequantization factors in DC global "
+        "(after photon noise, same bundle as libjxl DequantMatrices::DecodeDC). "
+        "Each factor must be a finite positive float; 1 leaves that channel "
+        "unchanged. "
+        "Default implicit wire values are 1/32, 1/4, 1/2 per channel. Requires a "
+        "successful LF-global prefix parse, no spline edit on the frame, and no "
+        "TOC strip / center-first shuffle (TOC permutation may be non-empty).",
+        &lf_dc_quant_mul, ParseLfDcQuantMulOpt);
+    cmdline->AddOptionValue(
+        '\0', "lf-global-scale", "N",
+        "VarDCT only: set the quantizer global_scale U32 in LF-global (same "
+        "QuantizerParams bundle as libjxl immediately after LF dequant). "
+        "Integer 1..32768; leaves quant_dc unchanged from the input. Same spline / "
+        "TOC-strip constraints as --lf-dc-quant-mul.",
+        &lf_global_scale, ParseLfGlobalScaleOpt);
+    cmdline->AddOptionValue(
         '\0', "set-epf-iters", "N",
         "Set edge-preserving filter (EPF) iteration count (0–3) in the frame "
         "restoration\n"
@@ -2115,8 +2674,10 @@ struct Args {
         "logit space (s clamped to [-0.45, 2]); blur and sharpen use opposite\n"
         "steps so the same A cancels. From the default kernel sum, sharpen A=1\n"
         "moves s halfway toward the minimum (max sharp). Weights matching the\n"
-        "implicit encoder defaults snap to gab_custom off. Effective baseline:\n"
-        "gab off → 0, implicit default gab → libjxl defaults, custom → stored.\n"
+        "implicit encoder defaults snap to gab_custom off. Effective baseline\n"
+        "matches --info gab_effective: gab off → 0; packed restoration\n"
+        "all_default → implicit default gab (libjxl defaults); gab on implicit →\n"
+        "same; custom → stored weights.\n"
         "LF and reference-only frames are skipped. Mutually exclusive with\n"
         "--gab-sharpen and --gab-weights.",
         &gab_blur, StoreGabStringArg);
@@ -2211,11 +2772,14 @@ static bool InfoModeUsesNonDefaultOptions(const Args& a) {
          a.box_order.order != jxltran::BoxOrder::kAsIs ||
          a.brob.mode != jxltran::BrobOpt::kAsIs || a.set_orientation != 0 ||
          a.rel_orientation != 0 || a.set_bits_per_sample != 0 ||
-         a.num_loops.set || a.tps.set || a.crop.set || a.frames.set ||
+         a.main_float.set || a.main_exp.set ||
+         a.num_loops.set || a.tps.set || a.intensity_target.set ||
+         a.crop.set || a.frames.set ||
          a.keep_frames.set || a.keep_listed_frames ||
          a.group_order != jxltran::TocGroupOrderCli::kKeep || a.photon_iso.set ||
-         a.photon_weights != nullptr ||
-         a.set_splines_from != nullptr || a.clear_splines_frames.set ||
+         a.photon_weights != nullptr || a.lf_dc_quant_mul.set ||
+         a.lf_global_scale.set || a.set_splines_from != nullptr ||
+         a.clear_splines_frames.set ||
          a.lf_chunk0_tail_trim.set ||
          a.gab_blur != nullptr ||
          a.gab_sharpen != nullptr || a.gab_weights != nullptr ||
@@ -2259,6 +2823,26 @@ static const char* BlendModeInfoSlug(uint32_t m) {
   }
 }
 
+static bool IccDataColorSpaceIsCmyk(const std::vector<uint8_t>& icc) {
+  if (icc.size() < 20) return false;
+  auto lower = [](uint8_t b) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(b)));
+  };
+  return lower(icc[16]) == 'c' && lower(icc[17]) == 'm' &&
+         lower(icc[18]) == 'y' && lower(icc[19]) == 'k';
+}
+
+static bool MetadataHasExplicitBlackExtra(const jxltran::ImageMetadata& im) {
+  const size_t n = static_cast<size_t>(im.num_extra);
+  for (size_t i = 0; i < n && i < im.ec_info.size(); ++i) {
+    const jxltran::ExtraChannelInfo& ec = im.ec_info[i];
+    if (!ec.d_alpha && ec.type == jxltran::ExtraChannelType::kBlack) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static void PrintJxlInfoStdout(const jxltran::ParsedCodestream& parsed) {
   uint32_t orient = parsed.image.metadata.orientation;
   if (orient < 1 || orient > 8) orient = 1;
@@ -2273,7 +2857,68 @@ static void PrintJxlInfoStdout(const jxltran::ParsedCodestream& parsed) {
          parsed.image.metadata.have_animation ? "yes" : "no");
   printf("xyb_encoded: %s\n",
          parsed.image.metadata.xyb_encoded ? "yes" : "no");
+  const jxltran::ImageMetadata& im = parsed.image.metadata;
+  const bool icc_cmyk =
+      im.colour_encoding.want_icc &&
+      IccDataColorSpaceIsCmyk(parsed.image.icc_bytes);
+  const char* mclabel = "RGB";
+  if (im.xyb_encoded) {
+    mclabel = "XYB";
+  } else {
+    bool any_ycbcr = false;
+    bool regular_without_ycbcr = false;
+    for (const jxltran::FramedUnit& fu : parsed.frames) {
+      const jxltran::FrameHeader& fh = fu.frame;
+      if (fh.frame_type != jxltran::kFrameTypeRegular &&
+          fh.frame_type != jxltran::kFrameTypeSkipProgressive) {
+        continue;
+      }
+      if (fh.do_YCbCr) {
+        any_ycbcr = true;
+      } else {
+        regular_without_ycbcr = true;
+      }
+    }
+    if (any_ycbcr && regular_without_ycbcr) {
+      mclabel = "mixed";
+    } else if (any_ycbcr) {
+      mclabel = "YCbCr";
+    } else if (im.colour_encoding.colour_space == jxltran::ColourSpace::kGrey) {
+      mclabel = "Grey";
+    } else {
+      mclabel = "RGB";
+    }
+  }
+  const bool cmyk_rgb_main =
+      icc_cmyk && !im.xyb_encoded && std::strcmp(mclabel, "RGB") == 0;
+  const char* mclabel_out = cmyk_rgb_main ? "CMY" : mclabel;
+  printf("main_colour: label=%s bits=%" PRIu32 " float_sample=%s",
+         mclabel_out, im.bit_depth.bits_per_sample,
+         im.bit_depth.float_sample ? "yes" : "no");
+  if (im.bit_depth.float_sample) {
+    printf(" exp_bits=%" PRIu32, im.bit_depth.exp_bits);
+  }
+  printf(" want_icc=%s\n", im.colour_encoding.want_icc ? "yes" : "no");
+  if (icc_cmyk) {
+    fputs("icc_data_space: CMYK\n", stdout);
+  }
   printf("num_extra: %" PRIu32 "\n", parsed.image.metadata.num_extra);
+  {
+    const jxltran::ToneMapping& tm = im.tone_mapping;
+    if (im.all_default) {
+      printf("tone_mapping: default (image metadata all_default)\n");
+    } else if (tm.all_default) {
+      printf("tone_mapping: default\n");
+    } else {
+      printf(
+          "tone_mapping: intensity_target=%.9g min_nits=%.9g "
+          "relative_to_max_display=%s linear_below=%.9g\n",
+          static_cast<double>(jxltran::F16BitsToFloat(tm.intensity_target)),
+          static_cast<double>(jxltran::F16BitsToFloat(tm.min_nits)),
+          tm.relative_to_max_display ? "true" : "false",
+          static_cast<double>(jxltran::F16BitsToFloat(tm.linear_below)));
+    }
+  }
   bool has_alpha_channel = false;
   for (const auto& ec : parsed.image.metadata.ec_info) {
     if (ec.type == jxltran::ExtraChannelType::kAlpha) {
@@ -2282,6 +2927,72 @@ static void PrintJxlInfoStdout(const jxltran::ParsedCodestream& parsed) {
     }
   }
   printf("has_alpha_channel: %s\n", has_alpha_channel ? "yes" : "no");
+
+  for (uint32_t i = 0; i < parsed.image.metadata.num_extra; ++i) {
+    const jxltran::ExtraChannelInfo& ec = parsed.image.metadata.ec_info[i];
+    printf("extra_channel: %" PRIu32 " d_alpha=%s", i,
+           ec.d_alpha ? "yes" : "no");
+    if (!ec.d_alpha) {
+      const char* tslug = "unknown";
+      switch (ec.type) {
+        case jxltran::ExtraChannelType::kAlpha:
+          tslug = "alpha";
+          break;
+        case jxltran::ExtraChannelType::kDepth:
+          tslug = "depth";
+          break;
+        case jxltran::ExtraChannelType::kSpotColour:
+          tslug = "spot";
+          break;
+        case jxltran::ExtraChannelType::kSelectionMask:
+          tslug = "selection";
+          break;
+        case jxltran::ExtraChannelType::kBlack:
+          tslug = "black";
+          break;
+        case jxltran::ExtraChannelType::kCFA:
+          tslug = "cfa";
+          break;
+        case jxltran::ExtraChannelType::kThermal:
+          tslug = "thermal";
+          break;
+        case jxltran::ExtraChannelType::kNonOptional:
+          tslug = "nonoptional";
+          break;
+        case jxltran::ExtraChannelType::kOptional:
+          tslug = "optional";
+          break;
+      }
+      printf(" type=%s dim_shift=%" PRIu32 " bits=%" PRIu32 " float_sample=%s",
+             tslug, ec.dim_shift, ec.bit_depth.bits_per_sample,
+             ec.bit_depth.float_sample ? "yes" : "no");
+      if (ec.bit_depth.float_sample) {
+        printf(" exp_bits=%" PRIu32, ec.bit_depth.exp_bits);
+      }
+      fputs(" name_hex=", stdout);
+      for (uint8_t c : ec.name) printf("%02x", c);
+      if (ec.type == jxltran::ExtraChannelType::kAlpha) {
+        printf(" alpha_associated=%s", ec.alpha_associated ? "yes" : "no");
+      }
+      if (ec.type == jxltran::ExtraChannelType::kSpotColour) {
+        printf(" spot_rgb_solidity=%.9g,%.9g,%.9g,%.9g",
+               static_cast<double>(jxltran::F16BitsToFloat(ec.spot_red)),
+               static_cast<double>(jxltran::F16BitsToFloat(ec.spot_green)),
+               static_cast<double>(jxltran::F16BitsToFloat(ec.spot_blue)),
+               static_cast<double>(jxltran::F16BitsToFloat(ec.spot_solidity)));
+      }
+      if (ec.type == jxltran::ExtraChannelType::kCFA) {
+        printf(" cfa_channel=%" PRIu32,
+               static_cast<unsigned>(ec.cfa_channel));
+      }
+    } else {
+      printf(" type=alpha(implicit) dim_shift=%" PRIu32, ec.dim_shift);
+    }
+    fputc('\n', stdout);
+  }
+  if (cmyk_rgb_main && !MetadataHasExplicitBlackExtra(im)) {
+    fputs("implicit_cmyk_k: yes\n", stdout);
+  }
 
   for (size_t i = 0; i < parsed.frames.size(); ++i) {
     const jxltran::FrameHeader& fh = parsed.frames[i].frame;
@@ -2371,6 +3082,11 @@ static void PrintJxlInfoStdout(const jxltran::ParsedCodestream& parsed) {
                jxltran::EpfSharpUniformityForInfo(fh.restoration.all_default,
                                                   fh.restoration));
       }
+      const jxltran::FramedUnit& fu = parsed.frames[i];
+      if (vardct && fu.lf_global_quantizer_parsed) {
+        printf("lf_global_scale: %" PRIuS " %u\n", i,
+               static_cast<unsigned>(fu.lf_global_quantizer_global_scale));
+      }
     }
   }
 }
@@ -2427,7 +3143,9 @@ int main(int argc, const char* argv[]) {
   }
   if (args.frames.set && !args.keep_listed_frames &&
       args.GabOptionCount() == 0 &&
-      !args.NeedsPhotonNoiseAny() && !args.NeedsSplinesSet() &&
+      !args.NeedsPhotonNoiseAny() && !args.NeedsLfDcQuantMul() &&
+      !args.NeedsLfGlobalScale() &&
+      !args.NeedsSplinesSet() &&
       !args.NeedsClearSplinesFrames() && !args.NeedsLfGlobalChunk0TailTrim() &&
       args.group_order == jxltran::TocGroupOrderCli::kKeep &&
       !args.NeedsEpfIters() && !args.NeedsEpfAmpScale() &&
@@ -2439,6 +3157,7 @@ int main(int argc, const char* argv[]) {
             "--gab-sharpen, --gab-weights, --set-epf-iters, "
             "--set-epf-amplitude-scale, --set-epf-uniformity, "
             "--set-photon-noise-iso, --set-photon-noise-weights, "
+            "--lf-dc-quant-mul, --lf-global-scale, "
             "--set-splines-from, --clear-splines-frames, "
             "--lf-global-chunk0-tail-trim-bytes, --set-frame-names, "
             "--set-frame-region, or a\n"
@@ -2487,13 +3206,14 @@ int main(int argc, const char* argv[]) {
             "--clear-splines-frames\n");
     return 1;
   }
-  if (args.NeedsLfGlobalChunk0TailTrim() && !args.NeedsClearSplinesFrames()) {
+  if (args.NeedsLfGlobalChunk0TailTrim() && !args.NeedsClearSplinesFrames() &&
+      !args.NeedsLfGlobalScale()) {
     fprintf(stderr,
             "jxltran: --lf-global-chunk0-tail-trim-bytes requires "
-            "--clear-splines-frames in the same invocation\n");
+            "--clear-splines-frames or --lf-global-scale in the same invocation\n");
     return 1;
   }
-  if (args.NeedsLfGlobalChunk0TailTrim()) {
+  if (args.NeedsLfGlobalChunk0TailTrim() && args.NeedsClearSplinesFrames()) {
     for (const auto& pr : args.lf_chunk0_tail_trim.pairs) {
       if (!std::binary_search(args.clear_splines_frames.indices.begin(),
                               args.clear_splines_frames.indices.end(),
@@ -2559,7 +3279,7 @@ int main(int argc, const char* argv[]) {
             "jxltran: --check_reversible requires an OUTPUT file argument\n");
     return 1;
   }
-  if (args.opsin_inverse && !args.NeedsOpsinAdjust()) {
+  if (args.opsin_inverse && !args.NeedsOpsinSliderArgs()) {
     fprintf(stderr,
             "jxltran: --opsin-inverse requires at least one of --opsin-exposure, "
             "--opsin-temperature, --opsin-tint, --opsin-hue\n");
@@ -2846,7 +3566,8 @@ int main(int argc, const char* argv[]) {
 
   const bool needs_codestream_transform =
       args.NeedsHeaderMod() || args.crop.set || args.GabOptionCount() > 0 ||
-      args.NeedsPhotonNoiseAny() || args.NeedsSplinesSet() ||
+      args.NeedsPhotonNoiseAny() || args.NeedsLfDcQuantMul() ||
+      args.NeedsLfGlobalScale() || args.NeedsSplinesSet() ||
       args.NeedsClearSplinesFrames() || args.NeedsLfGlobalChunk0TailTrim() ||
       args.NeedsEpfIters() || args.NeedsEpfAmpScale() ||
       args.NeedsEpfUniformity() ||
@@ -2910,19 +3631,51 @@ int main(int argc, const char* argv[]) {
           mod.set_orientation = 0;
         }
         mod.set_bits_per_sample = args.set_bits_per_sample;
+        if (args.main_float.set) {
+          mod.set_main_float_sample = true;
+          mod.main_float_sample = (args.main_float.value != 0);
+        }
+        if (args.main_exp.set) {
+          mod.set_main_exp_bits = true;
+          mod.main_exp_bits = args.main_exp.value;
+        }
         mod.have_set_num_loops = args.num_loops.set;
         mod.set_num_loops = args.num_loops.value;
         mod.have_set_tps = args.tps.set;
         mod.set_tps_numerator = args.tps.numerator;
         mod.set_tps_denominator = args.tps.denominator;
+        mod.have_set_intensity_target = args.intensity_target.set;
+        mod.intensity_target_to_default_bundle =
+            args.intensity_target.to_default_bundle;
+        mod.intensity_target_nits = args.intensity_target.nits;
+        for (const std::string& spec : args.set_extra_channel_specs) {
+          jxltran::ExtraChannelHeaderPatch ep;
+          if (!ParseOneExtraChannelPatch(spec.c_str(), &ep)) return false;
+          mod.extra_channel_patches.push_back(std::move(ep));
+        }
+        if (args.file_out && !mod.extra_channel_patches.empty()) {
+          undo_rec.NoteExtraChannelHeaderBeforeApply(parsed,
+                                                     mod.extra_channel_patches);
+        }
         if (!jxltran::ApplyHeaderMod(&parsed, mod)) return false;
       }
       if (args.file_out) {
-        uint32_t orient_after = parsed.image.metadata.orientation;
-        if (orient_after < 1 || orient_after > 8) orient_after = 1;
-        undo_rec.NoteHeaderChanges(
-            args.set_orientation != 0, args.rel_orientation != 0, orient_after,
-            args.set_bits_per_sample != 0, args.num_loops.set, args.tps.set);
+        const bool hdr_undo_fields =
+            args.set_orientation != 0 || args.rel_orientation != 0 ||
+            args.set_bits_per_sample != 0 || args.main_float.set ||
+            args.main_exp.set || args.num_loops.set ||
+            args.tps.set || args.intensity_target.set;
+        if (hdr_undo_fields) {
+          uint32_t orient_after = parsed.image.metadata.orientation;
+          if (orient_after < 1 || orient_after > 8) orient_after = 1;
+          undo_rec.NoteHeaderChanges(
+              args.set_orientation != 0, args.rel_orientation != 0,
+              orient_after,
+              args.set_bits_per_sample != 0 || args.main_float.set ||
+                  args.main_exp.set,
+              args.num_loops.set,
+              args.tps.set, args.intensity_target.set);
+        }
       }
       if (args.NeedsOpsinAdjust()) {
         jxltran::OpsinAdjustParams oa;
@@ -2933,18 +3686,72 @@ int main(int argc, const char* argv[]) {
         }
         if (args.opsin_tint.set) oa.tint = args.opsin_tint.value;
         if (args.opsin_hue.set) oa.hue = args.opsin_hue.value;
+        if (args.opsin_bias_x.set) {
+          oa.opsin_bias_xyb[0].set = true;
+          oa.opsin_bias_xyb[0].value = args.opsin_bias_x.value;
+        }
+        if (args.opsin_bias_y.set) {
+          oa.opsin_bias_xyb[1].set = true;
+          oa.opsin_bias_xyb[1].value = args.opsin_bias_y.value;
+        }
+        if (args.opsin_bias_b.set) {
+          oa.opsin_bias_xyb[2].set = true;
+          oa.opsin_bias_xyb[2].value = args.opsin_bias_b.value;
+        }
+        if (args.opsin_quant_bias_0.set) {
+          oa.quant_bias_delta[0].set = true;
+          oa.quant_bias_delta[0].value = args.opsin_quant_bias_0.value;
+        }
+        if (args.opsin_quant_bias_1.set) {
+          oa.quant_bias_delta[1].set = true;
+          oa.quant_bias_delta[1].value = args.opsin_quant_bias_1.value;
+        }
+        if (args.opsin_quant_bias_2.set) {
+          oa.quant_bias_delta[2].set = true;
+          oa.quant_bias_delta[2].value = args.opsin_quant_bias_2.value;
+        }
+        if (args.opsin_quant_bias_3.set) {
+          oa.quant_bias_delta[3].set = true;
+          oa.quant_bias_delta[3].value = args.opsin_quant_bias_3.value;
+        }
         bool opsin_changed = false;
         if (!jxltran::ApplyOpsinAdjust(&parsed, oa, &opsin_changed)) {
           return false;
         }
         if (opsin_changed) wrote_anything = true;
       }
-      if (args.file_out && args.NeedsOpsinAdjust() && !args.opsin_inverse) {
+      if (args.file_out && args.NeedsOpsinSliderArgs() && !args.opsin_inverse) {
         undo_rec.NoteOpsinAdjust(
             args.opsin_exposure.set, args.opsin_temperature.set,
             args.opsin_tint.set, args.opsin_hue.set, args.opsin_exposure.value,
             args.opsin_temperature.value, args.opsin_tint.value,
             args.opsin_hue.value);
+      }
+      if (args.file_out && !args.opsin_inverse &&
+          (args.opsin_bias_x.set || args.opsin_bias_y.set ||
+           args.opsin_bias_b.set)) {
+        const bool set_bias[3] = {args.opsin_bias_x.set, args.opsin_bias_y.set,
+                                  args.opsin_bias_b.set};
+        float undo_bias[3];
+        jxltran::ComputeOpsinBiasUndoToImplicitDefault(parsed.image.metadata,
+                                                       set_bias, undo_bias);
+        undo_rec.NoteOpsinBiasAdjust(
+            args.opsin_bias_x.set, args.opsin_bias_y.set, args.opsin_bias_b.set,
+            undo_bias[0], undo_bias[1], undo_bias[2]);
+      }
+      if (args.file_out && !args.opsin_inverse &&
+          (args.opsin_quant_bias_0.set || args.opsin_quant_bias_1.set ||
+           args.opsin_quant_bias_2.set || args.opsin_quant_bias_3.set)) {
+        const bool set_q[4] = {
+            args.opsin_quant_bias_0.set, args.opsin_quant_bias_1.set,
+            args.opsin_quant_bias_2.set, args.opsin_quant_bias_3.set};
+        float undo_q[4];
+        jxltran::ComputeQuantBiasUndoToImplicitDefault(parsed.image.metadata, set_q,
+                                                     undo_q);
+        undo_rec.NoteOpsinQuantBiasAdjust(
+            args.opsin_quant_bias_0.set, args.opsin_quant_bias_1.set,
+            args.opsin_quant_bias_2.set, args.opsin_quant_bias_3.set, undo_q[0],
+            undo_q[1], undo_q[2], undo_q[3]);
       }
       if (args.set_frame_regions.set) {
         for (const auto& pr : args.set_frame_regions.pairs) {
@@ -3078,6 +3885,33 @@ int main(int argc, const char* argv[]) {
         if (!ok) return false;
         if (args.file_out) {
           undo_rec.FinalizePhotonNoiseAfterApply(parsed);
+        }
+        wrote_anything = true;
+      }
+      if (args.NeedsLfDcQuantMul()) {
+        float m[3] = {args.lf_dc_quant_mul.mx, args.lf_dc_quant_mul.my,
+                      args.lf_dc_quant_mul.mb};
+        std::vector<size_t> lf_dc_splice;
+        if (args.file_out) {
+          jxltran::ListLfDcQuantMulTargetFrames(parsed, m, frame_sel,
+                                                &lf_dc_splice);
+        }
+        if (!jxltran::ApplyLfDcQuantMul(&parsed, true, m, frame_sel)) {
+          return false;
+        }
+        if (args.file_out) {
+          undo_rec.NoteLfDcQuantMulForward(lf_dc_splice, m[0], m[1], m[2]);
+        }
+        wrote_anything = true;
+      }
+      if (args.NeedsLfGlobalScale()) {
+        if (args.file_out) {
+          undo_rec.CaptureLfGlobalScaleBeforeApply(parsed, frame_sel,
+                                                   args.lf_global_scale.value);
+        }
+        if (!jxltran::ApplyLfGlobalScale(&parsed, true, args.lf_global_scale.value,
+                                         frame_sel)) {
+          return false;
         }
         wrote_anything = true;
       }

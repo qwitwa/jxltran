@@ -88,13 +88,16 @@ Fields in the **image header** (and related metadata-only canvas changes): orien
 |--------|----------|----------------|
 | `--set-orientation` | `1`–`8`, `90`, `180`, `270` | Set Exif-style orientation (absolute). `90` / `180` / `270` are clockwise degrees (same as tags `6` / `3` / `8`). |
 | `--set-orientation-relative` | `1`–`8`, `90`, `180`, `270` | Compose this transform *after* the file’s current orientation. Mutually exclusive with **`--set-orientation`**. |
-| `--set-bits-per-sample` | `1`–`32` | Set `bits_per_sample` (XYB-encoded images only; metadata hint for decoders). |
+| `--set-bits-per-sample` | `1`–`32` | Set image-header `bits_per_sample`. For XYB-encoded images this is mainly a decoder output-precision hint; for non-XYB images it is part of the coded representation. |
+| `--set-main-float` | `0` or `1` | Set image-header `float_sample` for the main channel (`0` = integer, `1` = float). |
+| `--set-main-exp` | `2`–`8` | Exponent bits for float main samples (meaningful with `--set-main-float=1` or when the file is already float). |
+| `--set-extra-channel` | `INDEX:key=val,...` | Edit **ExtraChannelInfo** for extra channel `INDEX` (`0`…`num_extra−1`). **`dim_shift`** and the number of extra channels are fixed. Keys: `d_alpha` (`0`/`1`), `type` (slug: `alpha`, `spot`, `depth`, `black`, `cfa`, `thermal`, `optional`, `unknown`), `bits`, `float`, `exp`, `assoc` / `alpha_associated`, `name_hex`, `cfa`, `spot_r` / `spot_g` / `spot_b` / `spot_solidity` / `spot_a`. Repeat the option for multiple channels. **`--info`** prints one `extra_channel:` line per channel. |
 | `--set-num-loops` | `N` | Animation loop count (`0` = infinite); animated images only. |
 | `--set-tps` | `N`, `N/D`, or `P%` | Ticks per second (`P%` scales the file’s current TPS); animated images only. |
 | `--opsin-exposure` | `EV` | XYB only: exposure in stops (linear RGB after XYB→RGB). |
 | `--opsin-temperature` | `T` | XYB only: warmth (−100..+100). |
 | `--opsin-tint` | `T` | XYB only: green vs magenta (−100..+100). |
-| `--opsin-hue` | `T` | XYB only: small hue tweak in the linear R–B plane. |
+| `--opsin-hue` | `T` | XYB only: Rec. 709 luma–axis hue (HSL-like); −100..100 → −90°..+90°. |
 | `--crop` | `WxH` or `WxH+X+Y` | Metadata-only canvas resize/crop; **coordinates are display space** (after orientation, like `djxl`). Extending past the current canvas adds implicit padding. |
 
 ### Codestream layout: frames and TOC order

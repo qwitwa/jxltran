@@ -58,6 +58,12 @@ static bool ShuffleBodyStreamSizesAsInOriginal(const FramedUnit& fu,
   if (fu.photon_noise_edit) {
     pending += static_cast<int64_t>(fu.photon_noise_delta_bytes);
   }
+  if (fu.lf_global_dc_quant_edit) {
+    pending += static_cast<int64_t>(fu.lf_global_dc_quant_delta_bytes);
+  }
+  if (fu.lf_global_quantizer_edit) {
+    pending += static_cast<int64_t>(fu.lf_global_quantizer_delta_bytes);
+  }
   if (fu.spline_edit && fu.spline_edit_delta_bits != 0) {
     if (fu.spline_edit_delta_bits % 8 != 0) return false;
     pending += static_cast<int64_t>(fu.spline_edit_delta_bits / 8);

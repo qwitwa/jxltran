@@ -47,9 +47,15 @@ class UndoRecorder {
 
   void CapturePreHeader(const ParsedCodestream& parsed);
   void NoteHeaderChanges(bool set_abs_orient_nonzero, bool set_rel_nonzero,
-                         uint32_t orient_after, bool set_bits_nonzero,
-                         bool set_loops, bool set_tps);
+                         uint32_t orient_after, bool set_main_bit_depth_nonzero,
+                         bool set_loops, bool set_tps, bool set_intensity_target);
   void SetSelectiveFramesCopy(const std::vector<size_t>& indices);
+
+  // Call immediately before ApplyHeaderMod when |patches| is non-empty; records
+  // per-index ExtraChannelInfo snapshots from the pre-apply codestream.
+  void NoteExtraChannelHeaderBeforeApply(
+      const ParsedCodestream& pre,
+      const std::vector<ExtraChannelHeaderPatch>& patches);
 
   void NoteCropApplied(uint32_t old_canvas_w, uint32_t old_canvas_h,
                        int32_t storage_dx, int32_t storage_dy,
@@ -64,6 +70,10 @@ class UndoRecorder {
   void FinalizeEpfRestorationUndo(uint32_t mask);
   void NoteOpsinAdjust(bool exp, bool temp, bool tint, bool hue, float ev,
                        float temperature, float tint_v, float hue_v);
+  void NoteOpsinBiasAdjust(bool sx, bool sy, bool sb, float vx, float vy,
+                           float vb);
+  void NoteOpsinQuantBiasAdjust(bool s0, bool s1, bool s2, bool s3, float v0,
+                                float v1, float v2, float v3);
 
   // |orient_before_header| is the EXIF tag before --set-orientation in this
   // run (same basis as --crop / --set-frame-region).
@@ -79,17 +89,27 @@ class UndoRecorder {
       const std::vector<std::pair<size_t, int64_t>>& entries);
 
   // After OUTPUT is written, compares LF-global physical chunk0 vs the
-  // pre-transform codestream and fills per-entry tail trim counts (0–255).
+  // pre-transform codestream and fills per-entry tail trim counts (0–255)
+  // for spline-add and --lf-global-scale undos.
   void FinalizeSplineLfGlobalChunk0TailTrim(const uint8_t* ref_codestream,
                                             size_t ref_size,
                                             const uint8_t* out_codestream,
                                             size_t out_size);
 
-  // Call immediately before ApplyPhotonNoiseIso / ApplyPhotonNoiseWeights.
+  // Call immediately before ApplyLfGlobalScale when |file_out| is set.
+  void CaptureLfGlobalScaleBeforeApply(const ParsedCodestream& cs,
+                                       const std::vector<size_t>* only_frames,
+                                       uint32_t forward_new_scale);
   void CapturePhotonNoiseBeforeApply(const ParsedCodestream& cs,
                                      const std::vector<size_t>* only_frames);
   // Call immediately after a successful photon pass.
   void FinalizePhotonNoiseAfterApply(const ParsedCodestream& cs);
+
+  // Call after a successful forward --lf-dc-quant-mul (same mx,my,mb as CLI).
+  // |splice_frames| from ListLfDcQuantMulTargetFrames(cs, mul, only, ...) on
+  // the pre-apply codestream.
+  void NoteLfDcQuantMulForward(const std::vector<size_t>& splice_frames, float mx,
+                               float my, float mb);
 
   // Captures blending fields for each frame mentioned in |overrides| (first
   // mention per frame index only), before |ApplyFrameBlendOverrides|.
@@ -133,8 +153,7 @@ class UndoRecorder {
 
   // Pre-header snapshot (defaults if absent in bitstream).
   uint32_t orient_before_ = 1;
-  uint32_t bits_per_sample_before_ = 0;
-  bool have_bits_before_ = false;
+  BitDepth main_bit_depth_before_{};
   bool have_animation_before_ = false;
   uint32_t num_loops_before_ = 0;
   uint32_t tps_num_before_ = 1;
@@ -172,6 +191,14 @@ class UndoRecorder {
   float opsin_tint_ = 0.f;
   float opsin_hue_ = 0.f;
 
+  bool opsin_bias_undo_ = false;
+  bool opsin_bias_set_[3] = {false, false, false};
+  float opsin_bias_v_[3] = {0.f, 0.f, 0.f};
+
+  bool opsin_quant_bias_undo_ = false;
+  bool opsin_quant_bias_set_[4] = {false, false, false, false};
+  float opsin_quant_bias_v_[4] = {0.f, 0.f, 0.f, 0.f};
+
   struct FrameRegionUndo {
     size_t frame_index = 0;
     uint32_t orient_before_header = 1;
@@ -189,11 +216,24 @@ class UndoRecorder {
   std::vector<FrameNameUndo> frame_name_undos_;
 
   bool undo_orientation_ = false;
-  bool undo_bits_ = false;
+  bool undo_main_bit_depth_ = false;
   bool undo_loops_ = false;
   bool undo_tps_ = false;
+  bool undo_intensity_ = false;
+  ToneMapping tone_mapping_before_{};
+  bool image_metadata_all_default_before_ = false;
+
+  bool undo_extra_channels_ = false;
+  std::vector<std::pair<size_t, ExtraChannelInfo>> extra_channel_undo_;
 
   std::vector<size_t> selective_frames_;
+
+  struct LfGlobalScaleUndoEntry {
+    size_t frame_index = 0;
+    uint32_t old_scale = 0;
+    uint8_t lf_chunk0_tail_trim_bytes = 0;
+  };
+  std::vector<LfGlobalScaleUndoEntry> lf_global_scale_undos_;
 
   struct SplineAddUndoEntry {
     size_t frame_index = 0;
@@ -209,6 +249,10 @@ class UndoRecorder {
   };
   std::vector<PhotonBeforeSnap> photon_before_by_frame_;
   std::vector<PhotonNoiseUndoSpec> photon_undos_;
+
+  bool lf_dc_quant_mul_undo_ = false;
+  float lf_dc_quant_mul_forward_[3] = {1.f, 1.f, 1.f};
+  std::vector<size_t> lf_dc_splice_frames_;
 
   struct BlendUndo {
     size_t frame_index = 0;
@@ -235,6 +279,11 @@ class UndoRecorder {
 bool ArgsBoxPipelineReversibleForUndo(bool strip_nonzero, bool jxlp_non_keep,
                                       bool box_order_non_keep, bool brob_non_keep,
                                       bool append_jxl, bool meta_set_any);
+
+// Frames |ApplyLfDcQuantMul| would touch (call on pre-apply |cs|).
+void ListLfDcQuantMulTargetFrames(const ParsedCodestream& cs, const float mul[3],
+                                  const std::vector<size_t>* only_frames,
+                                  std::vector<size_t>* out_frames);
 
 }  // namespace jxltran
 

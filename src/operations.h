@@ -30,6 +30,36 @@ struct GabArgs {
   float custom[6] = {};
 };
 
+// Edits one extra channel entry in ImageMetadata (|num_extra| and |dim_shift|
+// are not changed; reject |dim_shift| in the CLI parser).
+struct ExtraChannelHeaderPatch {
+  size_t index = 0;
+  bool set_d_alpha = false;
+  bool d_alpha = false;
+  bool set_type = false;
+  ExtraChannelType type = ExtraChannelType::kAlpha;
+  // Partial float/exp/bits updates merge with the existing channel (bits=0 in
+  // |bit_depth| means "leave bits_per_sample unchanged" until merge).
+  bool set_ec_bits_per_sample = false;
+  bool set_ec_float_sample = false;
+  bool set_ec_exp_bits = false;
+  BitDepth bit_depth{};
+  bool set_name = false;
+  std::vector<uint8_t> name;
+  bool set_alpha_associated = false;
+  bool alpha_associated = false;
+  bool set_spot_r = false;
+  float spot_r = 0.f;
+  bool set_spot_g = false;
+  float spot_g = 0.f;
+  bool set_spot_b = false;
+  float spot_b = 0.f;
+  bool set_spot_solidity = false;
+  float spot_solidity = 0.f;
+  bool set_cfa_channel = false;
+  uint32_t cfa_channel = 1;
+};
+
 struct HeaderMod {
   uint32_t set_orientation = 0;
   uint32_t set_bits_per_sample = 0;
@@ -38,10 +68,33 @@ struct HeaderMod {
   bool have_set_tps = false;
   uint32_t set_tps_numerator = 1;
   uint32_t set_tps_denominator = 1;
+
+  // Tone mapping (nits, or restore the implicit default bundle). Undo uses
+  // |have_tone_mapping_snapshot| instead of the user-facing intensity fields.
+  bool have_tone_mapping_snapshot = false;
+  ToneMapping tone_mapping_snapshot{};
+  // When true (verify path only), after restoring |tone_mapping_snapshot|, set
+  // |m.all_default| so packed image metadata round-trips byte-for-byte.
+  bool collapse_to_packed_all_default_image_metadata = false;
+  bool have_set_intensity_target = false;
+  bool intensity_target_to_default_bundle = false;
+  float intensity_target_nits = 0.f;
+
+  bool set_main_float_sample = false;
+  bool main_float_sample = false;
+  bool set_main_exp_bits = false;
+  uint32_t main_exp_bits = 0;
+
+  std::vector<ExtraChannelHeaderPatch> extra_channel_patches;
 };
 
 // Applies header-only modifications to |cs| (image header fields).
 bool ApplyHeaderMod(ParsedCodestream* cs, const HeaderMod& mod);
+
+// Replaces ImageMetadata.ec_info[index] with |snap| (for reversible undo of
+// --set-extra-channel). Sets metadata.all_default = false.
+bool RestoreExtraChannelInfoAtIndex(ParsedCodestream* cs, size_t index,
+                                    const ExtraChannelInfo& snap);
 
 // Reversible metadata-only crop / canvas resize. (dx,dy) are relative to the
 // current canvas: output pixel (px,py) shows input (px+dx, py+dy). New canvas
@@ -159,6 +212,24 @@ bool ApplyPhotonNoiseWeights(ParsedCodestream* cs, bool change,
                              const char* weights_spec,
                              const std::vector<size_t>* only_frames = nullptr);
 
+// Multiplies the three LF channel dequantization F16 factors in DC global
+// (after photon noise). Default wire values match libjxl (1/32, 1/4, 1/2 before
+// the decoder's ×1/128). Each multiplier must be finite and **positive** (the
+// decoder rejects non-positive LF dequant). Requires no spline edit on the
+// frame (and no TOC strip / center-first shuffle); combines with photon noise
+// edits when LF-global prefix parses. Non-empty TOC permutations are OK: the
+// LF-global chunk is patched in stream order at the physical slot for logical
+// section 0.
+bool ApplyLfDcQuantMul(ParsedCodestream* cs, bool change, const float mul_xyb[3],
+                       const std::vector<size_t>* only_frames = nullptr);
+
+// VarDCT only: replaces the U32 `global_scale` in the QuantizerParams bundle
+// (libjxl Quantizer::Decode) immediately after LF dequant in LF-global section 0.
+// Leaves `quant_dc` unchanged from the parsed codestream. Same spline / TOC-strip
+// constraints as |ApplyLfDcQuantMul| (non-empty TOC permutations are fine).
+bool ApplyLfGlobalScale(ParsedCodestream* cs, bool change, uint32_t global_scale,
+                        const std::vector<size_t>* only_frames = nullptr);
+
 // Summary from the last successful per-frame decisions inside
 // |ApplySplinesFromFile| (optional).
 struct SplinesApplySummary {
@@ -205,9 +276,11 @@ bool ApplyClearSplinesOnFrames(ParsedCodestream* cs,
 
 // After |ApplyRemoveSplinesAddOnly| in the same pass, shrink the physical TOC
 // stream slot that carries logical LF-global (section 0) by |trim_bytes|
-// (1..255). Used when spline insert/remove left extra all-zero tail bytes vs
-// the reference codestream so |WriteCodestream| matches pre-edit bytes.
-// Requires |fu.spline_edit| with an empty mid from the clear step.
+// (1..255). Used when spline insert/remove or |ApplyLfGlobalScale| left extra
+// all-zero tail bytes vs the reference codestream so |WriteCodestream| matches
+// pre-edit bytes. With spline clears, requires |fu.spline_edit| with an empty
+// mid from the clear step; with |--lf-global-scale| on the same pass, requires
+// |fu.lf_global_quantizer_edit|.
 bool ApplyLfGlobalPhysicalChunk0TailTrim(ParsedCodestream* cs, size_t frame_index,
                                          uint8_t trim_bytes);
 

@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <optional>
 #include <vector>
 
 #include "bits.h"
@@ -26,6 +28,90 @@
 namespace jxltran {
 
 namespace {
+
+static const char* ExtraChannelTypeToCliSlug(ExtraChannelType t) {
+  switch (t) {
+    case ExtraChannelType::kAlpha:
+      return "alpha";
+    case ExtraChannelType::kDepth:
+      return "depth";
+    case ExtraChannelType::kSpotColour:
+      return "spot";
+    case ExtraChannelType::kSelectionMask:
+      return "selection";
+    case ExtraChannelType::kBlack:
+      return "black";
+    case ExtraChannelType::kCFA:
+      return "cfa";
+    case ExtraChannelType::kThermal:
+      return "thermal";
+    case ExtraChannelType::kNonOptional:
+      return "nonoptional";
+    case ExtraChannelType::kOptional:
+      return "optional";
+    default:
+      return nullptr;
+  }
+}
+
+// Appends a single ` --set-extra-channel=INDEX:...` that restores |ec|.
+static bool AppendSetExtraChannelRestoreToCmd(size_t index,
+                                               const ExtraChannelInfo& ec,
+                                               std::string* cmd) {
+  std::string spec;
+  char ib[48];
+  snprintf(ib, sizeof(ib), "%" PRIuS ":", index);
+  spec += ib;
+  if (ec.d_alpha) {
+    spec += "d_alpha=1";
+    cmd->append(" --set-extra-channel=");
+    cmd->append(spec);
+    return true;
+  }
+  spec += "d_alpha=0";
+  const char* slug = ExtraChannelTypeToCliSlug(ec.type);
+  if (!slug) return false;
+  char bitsbuf[160];
+  snprintf(bitsbuf, sizeof(bitsbuf), ",type=%s,bits=%" PRIu32 ",float=%d",
+           slug, ec.bit_depth.bits_per_sample, ec.bit_depth.float_sample ? 1 : 0);
+  spec += bitsbuf;
+  if (ec.bit_depth.float_sample) {
+    char expbuf[40];
+    snprintf(expbuf, sizeof(expbuf), ",exp=%" PRIu32, ec.bit_depth.exp_bits);
+    spec += expbuf;
+  }
+  if (ec.type == ExtraChannelType::kAlpha) {
+    char abuf[32];
+    snprintf(abuf, sizeof(abuf), ",assoc=%d", ec.alpha_associated ? 1 : 0);
+    spec += abuf;
+  }
+  if (!ec.name.empty()) {
+    spec += ",name_hex=";
+    for (uint8_t c : ec.name) {
+      char hx[4];
+      snprintf(hx, sizeof(hx), "%02x", static_cast<unsigned>(c));
+      spec += hx;
+    }
+  }
+  if (ec.type == ExtraChannelType::kSpotColour) {
+    char sp[384];
+    snprintf(sp, sizeof(sp),
+             ",spot_r=%.17g,spot_g=%.17g,spot_b=%.17g,spot_solidity=%.17g",
+             static_cast<double>(F16BitsToFloat(ec.spot_red)),
+             static_cast<double>(F16BitsToFloat(ec.spot_green)),
+             static_cast<double>(F16BitsToFloat(ec.spot_blue)),
+             static_cast<double>(F16BitsToFloat(ec.spot_solidity)));
+    spec += sp;
+  }
+  if (ec.type == ExtraChannelType::kCFA) {
+    char cf[48];
+    snprintf(cf, sizeof(cf), ",cfa=%" PRIu32, ec.cfa_channel);
+    spec += cf;
+  }
+  cmd->append(" --set-extra-channel=");
+  cmd->append(spec);
+  return true;
+}
 
 std::string ShellQuotePath(const char* s) {
   std::string out;
@@ -79,6 +165,22 @@ bool NameBytesEmitAsUndoQuotedAscii(const std::vector<uint8_t>& name) {
     if (b < 32 || b > 126) return false;
   }
   return !NameBytesEmitAsUndoUnquotedLiteral(name);
+}
+
+// |ApplyFrameBlendOverrides| mirrors the main row onto every extra channel, so a
+// single |--set-frame-blends| argv cannot invert a prior state where EC rows
+// differed from main. |VerifyRoundtripCodestream| still restores exactly via
+// |ApplyFrameBlendExactRestore|.
+bool ExtraChannelBlendingMatchesMain(
+    const FrameBlendingInfo& main,
+    const std::vector<FrameBlendingInfo>& ec) {
+  for (const FrameBlendingInfo& bi : ec) {
+    if (bi.mode != main.mode || bi.alpha_channel != main.alpha_channel ||
+        bi.clamp != main.clamp || bi.source != main.source) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void AppendFrameNameTokenForUndo(std::string* cmd,
@@ -241,12 +343,9 @@ void UndoRecorder::BlockCs(const char* reason) {
 void UndoRecorder::CapturePreHeader(const ParsedCodestream& parsed) {
   const ImageMetadata& m = parsed.image.metadata;
   orient_before_ = (m.orientation >= 1 && m.orientation <= 8) ? m.orientation : 1;
-  if (m.xyb_encoded) {
-    have_bits_before_ = true;
-    bits_per_sample_before_ = parsed.image.metadata.bit_depth.bits_per_sample;
-  } else {
-    have_bits_before_ = false;
-  }
+  // Snapshot main image BitDepth for --set-bits-per-sample / --set-main-float /
+  // --set-main-exp undo on any colour encoding (XYB and non-XYB).
+  main_bit_depth_before_ = m.bit_depth;
   if (m.have_animation) {
     have_animation_before_ = true;
     num_loops_before_ = m.animation.num_loops;
@@ -254,6 +353,36 @@ void UndoRecorder::CapturePreHeader(const ParsedCodestream& parsed) {
     tps_den_before_ = m.animation.tps_denominator;
   } else {
     have_animation_before_ = false;
+  }
+  tone_mapping_before_ = m.tone_mapping;
+  image_metadata_all_default_before_ = m.all_default;
+}
+
+void UndoRecorder::NoteExtraChannelHeaderBeforeApply(
+    const ParsedCodestream& pre,
+    const std::vector<ExtraChannelHeaderPatch>& patches) {
+  if (patches.empty()) return;
+  for (const ExtraChannelHeaderPatch& p : patches) {
+    if (p.index >= pre.image.metadata.ec_info.size()) continue;
+    bool dup = false;
+    for (const auto& prev : extra_channel_undo_) {
+      if (prev.first == p.index) {
+        dup = true;
+        break;
+      }
+    }
+    if (dup) continue;
+    extra_channel_undo_.emplace_back(
+        p.index, pre.image.metadata.ec_info[p.index]);
+  }
+  if (!extra_channel_undo_.empty()) {
+    undo_extra_channels_ = true;
+    has_any_step_ = true;
+    std::sort(extra_channel_undo_.begin(), extra_channel_undo_.end(),
+              [](const std::pair<size_t, ExtraChannelInfo>& a,
+                 const std::pair<size_t, ExtraChannelInfo>& b) {
+                return a.first < b.first;
+              });
   }
 }
 
@@ -339,6 +468,35 @@ void UndoRecorder::NoteOpsinAdjust(bool exp, bool temp, bool tint, bool hue,
   has_any_step_ = true;
 }
 
+void UndoRecorder::NoteOpsinBiasAdjust(bool sx, bool sy, bool sb, float vx,
+                                       float vy, float vb) {
+  if (!sx && !sy && !sb) return;
+  opsin_bias_undo_ = true;
+  opsin_bias_set_[0] = sx;
+  opsin_bias_set_[1] = sy;
+  opsin_bias_set_[2] = sb;
+  opsin_bias_v_[0] = vx;
+  opsin_bias_v_[1] = vy;
+  opsin_bias_v_[2] = vb;
+  has_any_step_ = true;
+}
+
+void UndoRecorder::NoteOpsinQuantBiasAdjust(bool s0, bool s1, bool s2, bool s3,
+                                             float v0, float v1, float v2,
+                                             float v3) {
+  if (!s0 && !s1 && !s2 && !s3) return;
+  opsin_quant_bias_undo_ = true;
+  opsin_quant_bias_set_[0] = s0;
+  opsin_quant_bias_set_[1] = s1;
+  opsin_quant_bias_set_[2] = s2;
+  opsin_quant_bias_set_[3] = s3;
+  opsin_quant_bias_v_[0] = v0;
+  opsin_quant_bias_v_[1] = v1;
+  opsin_quant_bias_v_[2] = v2;
+  opsin_quant_bias_v_[3] = v3;
+  has_any_step_ = true;
+}
+
 bool UndoRecorder::CaptureFrameRegionBeforeMove(
     const ParsedCodestream& parsed, size_t frame_index,
     uint32_t orient_before_header) {
@@ -388,16 +546,75 @@ void UndoRecorder::NoteSplinesAddedOnFrames(
 
 void UndoRecorder::FinalizeSplineLfGlobalChunk0TailTrim(
     const uint8_t* ref_cs, size_t ref_n, const uint8_t* out_cs, size_t out_n) {
-  if (spline_add_undos_.empty()) return;
+  if (spline_add_undos_.empty() && lf_global_scale_undos_.empty()) return;
   ParsedCodestream ref_parsed;
   ParsedCodestream out_parsed;
   if (!ReadCodestream(ref_cs, ref_n, &ref_parsed) ||
       !ReadCodestream(out_cs, out_n, &out_parsed)) {
     return;
   }
+  std::vector<size_t> frames;
+  for (const SplineAddUndoEntry& e : spline_add_undos_) {
+    frames.push_back(e.frame_index);
+  }
+  for (const LfGlobalScaleUndoEntry& e : lf_global_scale_undos_) {
+    frames.push_back(e.frame_index);
+  }
+  std::sort(frames.begin(), frames.end());
+  frames.erase(std::unique(frames.begin(), frames.end()), frames.end());
+  std::map<size_t, uint8_t> trim;
+  for (size_t fi : frames) {
+    trim[fi] = ComputeLfGlobalChunk0TailPaddingTrimBytes(
+        out_cs, out_n, out_parsed, ref_cs, ref_n, ref_parsed, fi);
+  }
   for (SplineAddUndoEntry& e : spline_add_undos_) {
-    e.lf_chunk0_tail_trim_bytes = ComputeLfGlobalChunk0TailPaddingTrimBytes(
-        out_cs, out_n, out_parsed, ref_cs, ref_n, ref_parsed, e.frame_index);
+    auto it = trim.find(e.frame_index);
+    if (it != trim.end()) {
+      e.lf_chunk0_tail_trim_bytes = it->second;
+    }
+  }
+  for (LfGlobalScaleUndoEntry& e : lf_global_scale_undos_) {
+    auto it = trim.find(e.frame_index);
+    if (it != trim.end()) {
+      e.lf_chunk0_tail_trim_bytes = it->second;
+    }
+  }
+}
+
+void UndoRecorder::CaptureLfGlobalScaleBeforeApply(
+    const ParsedCodestream& cs, const std::vector<size_t>* only_frames,
+    uint32_t forward_new_scale) {
+  lf_global_scale_undos_.clear();
+  const auto want = [&](size_t idx) -> bool {
+    if (only_frames == nullptr || only_frames->empty()) return true;
+    return std::binary_search(only_frames->begin(), only_frames->end(), idx);
+  };
+  std::optional<uint32_t> common_old;
+  for (size_t fi = 0; fi < cs.frames.size(); ++fi) {
+    if (!want(fi)) continue;
+    const FramedUnit& fu = cs.frames[fi];
+    const FrameHeader& fh = fu.frame;
+    const uint32_t ft = fh.frame_type;
+    if (ft == kFrameTypeLF || ft == kFrameTypeReferenceOnly) continue;
+    if (ft != kFrameTypeRegular && ft != kFrameTypeSkipProgressive) continue;
+    if (fh.encoding == kFrameEncModular) continue;
+    if (!fu.lf_global_quantizer_parsed) continue;
+    if (forward_new_scale == fu.lf_global_quantizer_global_scale) continue;
+    LfGlobalScaleUndoEntry e;
+    e.frame_index = fi;
+    e.old_scale = fu.lf_global_quantizer_global_scale;
+    if (common_old.has_value() && *common_old != e.old_scale) {
+      SetCodestreamNotReversible(
+          "--lf-global-scale: edited frames had different prior global_scale "
+          "(undo not emitted)");
+      lf_global_scale_undos_.clear();
+      return;
+    }
+    common_old = e.old_scale;
+    lf_global_scale_undos_.push_back(std::move(e));
+  }
+  if (!lf_global_scale_undos_.empty()) {
+    has_any_step_ = true;
   }
 }
 
@@ -470,6 +687,20 @@ void UndoRecorder::FinalizePhotonNoiseAfterApply(const ParsedCodestream& cs) {
   }
 }
 
+void UndoRecorder::NoteLfDcQuantMulForward(const std::vector<size_t>& splice_frames,
+                                           float mx, float my, float mb) {
+  lf_dc_quant_mul_undo_ = true;
+  lf_dc_splice_frames_ = splice_frames;
+  std::sort(lf_dc_splice_frames_.begin(), lf_dc_splice_frames_.end());
+  lf_dc_splice_frames_.erase(
+      std::unique(lf_dc_splice_frames_.begin(), lf_dc_splice_frames_.end()),
+      lf_dc_splice_frames_.end());
+  lf_dc_quant_mul_forward_[0] = mx;
+  lf_dc_quant_mul_forward_[1] = my;
+  lf_dc_quant_mul_forward_[2] = mb;
+  has_any_step_ = true;
+}
+
 void UndoRecorder::NoteFrameBlendBeforeOverrides(
     const ParsedCodestream& parsed,
     const std::vector<FrameBlendOverride>& overrides) {
@@ -502,16 +733,17 @@ void UndoRecorder::NoteKeepReorder(KeepReorderUndoSpec spec) {
 
 void UndoRecorder::NoteHeaderChanges(bool set_abs_orient_nonzero,
                                      bool set_rel_nonzero, uint32_t orient_after,
-                                     bool set_bits_nonzero, bool set_loops,
-                                     bool set_tps) {
+                                     bool set_main_bit_depth_nonzero,
+                                     bool set_loops, bool set_tps,
+                                     bool set_intensity_target) {
   if (set_abs_orient_nonzero || set_rel_nonzero) {
     if (orient_after != orient_before_) {
       undo_orientation_ = true;
       has_any_step_ = true;
     }
   }
-  if (set_bits_nonzero) {
-    undo_bits_ = true;
+  if (set_main_bit_depth_nonzero) {
+    undo_main_bit_depth_ = true;
     has_any_step_ = true;
   }
   if (set_loops) {
@@ -520,6 +752,10 @@ void UndoRecorder::NoteHeaderChanges(bool set_abs_orient_nonzero,
   }
   if (set_tps) {
     undo_tps_ = true;
+    has_any_step_ = true;
+  }
+  if (set_intensity_target) {
+    undo_intensity_ = true;
     has_any_step_ = true;
   }
 }
@@ -541,22 +777,14 @@ void UndoRecorder::FinalizePipelineCompatibility() {
     SetCodestreamNotReversible(
         "--crop combined with --set-splines-from (add-only undo not emitted)");
   }
+  if (crop_undo_ && !lf_global_scale_undos_.empty()) {
+    SetCodestreamNotReversible(
+        "--crop combined with --lf-global-scale (undo not emitted)");
+  }
   if (!frame_region_undos_.empty() && !spline_add_undos_.empty()) {
     SetCodestreamNotReversible(
         "--set-frame-region combined with --set-splines-from (add-only undo not "
         "emitted)");
-  }
-  for (const BlendUndo& b : blend_undos_) {
-    for (size_t e = 0; e < b.ec.size(); ++e) {
-      const FrameBlendingInfo& bi = b.ec[e];
-      if (bi.mode != b.main.mode || bi.alpha_channel != b.main.alpha_channel ||
-          bi.clamp != b.main.clamp || bi.source != b.main.source) {
-        SetCodestreamNotReversible(
-            "--set-frame-blends: extra-channel blending differs from main "
-            "(undo not emitted)");
-        return;
-      }
-    }
   }
 }
 
@@ -586,6 +814,11 @@ bool UndoRecorder::BuildUndoCommandLine(const char* argv0, const char* out_jxl,
     // there is no single argv inverse that round-trips arbitrary permutations.
     return false;
   }
+  for (const BlendUndo& b : blend_undos_) {
+    if (!ExtraChannelBlendingMatchesMain(b.main, b.ec)) {
+      return false;
+    }
+  }
   std::string cmd;
   cmd += ShellQuotePath(argv0);
   cmd += ' ';
@@ -612,11 +845,20 @@ bool UndoRecorder::BuildUndoCommandLine(const char* argv0, const char* out_jxl,
     snprintf(buf, sizeof(buf), " --set-orientation=%" PRIu32, orient_before_);
     cmd += buf;
   }
-  if (undo_bits_ && have_bits_before_) {
+  if (undo_main_bit_depth_) {
     char buf[64];
     snprintf(buf, sizeof(buf), " --set-bits-per-sample=%" PRIu32,
-             bits_per_sample_before_);
+             main_bit_depth_before_.bits_per_sample);
     cmd += buf;
+    if (main_bit_depth_before_.float_sample) {
+      cmd += " --set-main-float=1";
+      char ebuf[48];
+      snprintf(ebuf, sizeof(ebuf), " --set-main-exp=%" PRIu32,
+               main_bit_depth_before_.exp_bits);
+      cmd += ebuf;
+    } else {
+      cmd += " --set-main-float=0";
+    }
   }
   if (undo_loops_ && have_animation_before_) {
     char buf[64];
@@ -630,24 +872,98 @@ bool UndoRecorder::BuildUndoCommandLine(const char* argv0, const char* out_jxl,
     cmd += buf;
   }
 
-  if (opsin_undo_) {
-    cmd += " --opsin-inverse";
-    char buf[128];
-    if (opsin_set_exp_) {
-      snprintf(buf, sizeof(buf), " --opsin-exposure=%.9g", opsin_ev_);
+  if (undo_intensity_) {
+    if (tone_mapping_before_.all_default) {
+      cmd += " --set-intensity-target=default";
+    } else if (!tone_mapping_before_.relative_to_max_display &&
+               tone_mapping_before_.min_nits == FloatToF16Bits(0.f) &&
+               tone_mapping_before_.linear_below == FloatToF16Bits(0.f)) {
+      char buf[96];
+      snprintf(buf, sizeof(buf), " --set-intensity-target=%.9g",
+               static_cast<double>(
+                   F16BitsToFloat(tone_mapping_before_.intensity_target)));
       cmd += buf;
     }
-    if (opsin_set_temp_) {
-      snprintf(buf, sizeof(buf), " --opsin-temperature=%.9g", opsin_temp_);
-      cmd += buf;
+  }
+
+  if (undo_extra_channels_) {
+    for (const auto& pr : extra_channel_undo_) {
+      if (!AppendSetExtraChannelRestoreToCmd(pr.first, pr.second, &cmd)) {
+        return false;
+      }
     }
-    if (opsin_set_tint_) {
-      snprintf(buf, sizeof(buf), " --opsin-tint=%.9g", opsin_tint_);
-      cmd += buf;
+  }
+
+  // Forward pass applies opsin before crop, then gab/epf/splines/photon, then
+  // lf_dc, lf_global, toc, blend (jxltran.cc). VerifyRoundtripCodestream applies
+  // inverses in reverse composition order on a ParsedCodestream; the emitted
+  // reversible_undo argv still follows jxltran's fixed per-invocation order, so
+  // a single manual run may not match Verify unless operations commute.
+  if (!lf_global_scale_undos_.empty()) {
+    std::vector<size_t> ord;
+    ord.reserve(lf_global_scale_undos_.size());
+    for (size_t i = 0; i < lf_global_scale_undos_.size(); ++i) {
+      ord.push_back(i);
     }
-    if (opsin_set_hue_) {
-      snprintf(buf, sizeof(buf), " --opsin-hue=%.9g", opsin_hue_);
-      cmd += buf;
+    std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) {
+      return lf_global_scale_undos_[a].frame_index <
+             lf_global_scale_undos_[b].frame_index;
+    });
+    cmd += " --frames=";
+    for (size_t k = 0; k < ord.size(); ++k) {
+      if (k != 0) cmd += ',';
+      char b[32];
+      snprintf(b, sizeof(b), "%" PRIuS,
+               lf_global_scale_undos_[ord[k]].frame_index);
+      cmd += b;
+    }
+    char gbuf[48];
+    snprintf(gbuf, sizeof(gbuf), " --lf-global-scale=%" PRIu32,
+             lf_global_scale_undos_[ord[0]].old_scale);
+    cmd += gbuf;
+  }
+  if (!lf_global_scale_undos_.empty() && spline_add_undos_.empty()) {
+    bool any_trim_lf = false;
+    std::map<size_t, uint8_t> trim_lf;
+    for (const LfGlobalScaleUndoEntry& e : lf_global_scale_undos_) {
+      if (e.lf_chunk0_tail_trim_bytes == 0) continue;
+      any_trim_lf = true;
+      trim_lf[e.frame_index] = e.lf_chunk0_tail_trim_bytes;
+    }
+    if (any_trim_lf) {
+      cmd += " --lf-global-chunk0-tail-trim-bytes=";
+      bool first_tp = true;
+      for (const auto& pr : trim_lf) {
+        if (!first_tp) cmd += ',';
+        first_tp = false;
+        char tbuf[48];
+        snprintf(tbuf, sizeof(tbuf), "%" PRIuS ":%u", pr.first,
+                 static_cast<unsigned>(pr.second));
+        cmd += tbuf;
+      }
+    }
+  }
+
+  if (lf_dc_quant_mul_undo_) {
+    char qbuf[200];
+    const double ix =
+        static_cast<double>(1.0f / lf_dc_quant_mul_forward_[0]);
+    const double iy =
+        static_cast<double>(1.0f / lf_dc_quant_mul_forward_[1]);
+    const double iz =
+        static_cast<double>(1.0f / lf_dc_quant_mul_forward_[2]);
+    // %.9g truncates reciprocals so a manual undo argv may not parse back to
+    // the exact float inverse of the forward factors (breaks round-trip).
+    snprintf(qbuf, sizeof(qbuf), " --lf-dc-quant-mul=%.17g,%.17g,%.17g", ix, iy, iz);
+    cmd += qbuf;
+    if (!selective_frames_.empty()) {
+      cmd += " --frames=";
+      for (size_t i = 0; i < selective_frames_.size(); ++i) {
+        if (i != 0) cmd += ',';
+        char b[32];
+        snprintf(b, sizeof(b), "%" PRIuS, selective_frames_[i]);
+        cmd += b;
+      }
     }
   }
 
@@ -667,6 +983,46 @@ bool UndoRecorder::BuildUndoCommandLine(const char* argv0, const char* out_jxl,
     snprintf(buf, sizeof(buf), " --crop=%" PRIu32 "x%" PRIu32 "%+" PRId32 "%+" PRId32,
              crop_old_w_, crop_old_h_, -crop_storage_dx_, -crop_storage_dy_);
     cmd += buf;
+  }
+
+  if (opsin_quant_bias_undo_) {
+    char buf[112];
+    for (int qi = 0; qi < 4; ++qi) {
+      if (!opsin_quant_bias_set_[qi]) continue;
+      snprintf(buf, sizeof(buf), " --opsin-quant-bias-%d=%.9g", qi,
+               opsin_quant_bias_v_[qi]);
+      cmd += buf;
+    }
+  }
+  if (opsin_bias_undo_) {
+    char buf[96];
+    static const char* kBiasFlag[3] = {"--opsin-bias-x=", "--opsin-bias-y=",
+                                       "--opsin-bias-b="};
+    for (int bi = 0; bi < 3; ++bi) {
+      if (!opsin_bias_set_[bi]) continue;
+      snprintf(buf, sizeof(buf), " %s%.9g", kBiasFlag[bi], opsin_bias_v_[bi]);
+      cmd += buf;
+    }
+  }
+  if (opsin_undo_) {
+    cmd += " --opsin-inverse";
+    char buf[128];
+    if (opsin_set_exp_) {
+      snprintf(buf, sizeof(buf), " --opsin-exposure=%.9g", opsin_ev_);
+      cmd += buf;
+    }
+    if (opsin_set_temp_) {
+      snprintf(buf, sizeof(buf), " --opsin-temperature=%.9g", opsin_temp_);
+      cmd += buf;
+    }
+    if (opsin_set_tint_) {
+      snprintf(buf, sizeof(buf), " --opsin-tint=%.9g", opsin_tint_);
+      cmd += buf;
+    }
+    if (opsin_set_hue_) {
+      snprintf(buf, sizeof(buf), " --opsin-hue=%.9g", opsin_hue_);
+      cmd += buf;
+    }
   }
 
   if (gab_undo_) {
@@ -781,24 +1137,37 @@ bool UndoRecorder::BuildUndoCommandLine(const char* argv0, const char* out_jxl,
       cmd += buf;
     }
     bool any_trim = false;
+    std::map<size_t, uint8_t> trim_by_frame;
     for (const SplineAddUndoEntry& e : spline_add_undos_) {
-      if (e.lf_chunk0_tail_trim_bytes > 0) {
-        any_trim = true;
-        break;
+      if (e.lf_chunk0_tail_trim_bytes == 0) continue;
+      any_trim = true;
+      auto it = trim_by_frame.find(e.frame_index);
+      if (it != trim_by_frame.end() && it->second != e.lf_chunk0_tail_trim_bytes) {
+        return false;
       }
+      trim_by_frame[e.frame_index] = e.lf_chunk0_tail_trim_bytes;
+    }
+    for (const LfGlobalScaleUndoEntry& e : lf_global_scale_undos_) {
+      if (e.lf_chunk0_tail_trim_bytes == 0) continue;
+      any_trim = true;
+      auto it = trim_by_frame.find(e.frame_index);
+      if (it != trim_by_frame.end() && it->second != e.lf_chunk0_tail_trim_bytes) {
+        return false;
+      }
+      trim_by_frame[e.frame_index] = e.lf_chunk0_tail_trim_bytes;
     }
     if (any_trim) {
       cmd += " --lf-global-chunk0-tail-trim-bytes=";
       bool first_tp = true;
-      for (const SplineAddUndoEntry& e : spline_add_undos_) {
-        if (e.lf_chunk0_tail_trim_bytes == 0) continue;
+      for (const auto& pr : trim_by_frame) {
+        if (pr.second == 0) continue;
         if (!first_tp) {
           cmd += ',';
         }
         first_tp = false;
         char tbuf[48];
-        snprintf(tbuf, sizeof(tbuf), "%" PRIuS ":%u", e.frame_index,
-                 static_cast<unsigned>(e.lf_chunk0_tail_trim_bytes));
+        snprintf(tbuf, sizeof(tbuf), "%" PRIuS ":%u", pr.first,
+                 static_cast<unsigned>(pr.second));
         cmd += tbuf;
       }
     }
@@ -882,36 +1251,48 @@ ReversibleCheckStatus UndoRecorder::VerifyRoundtripCodestream(
     }
   }
 
-  if (undo_orientation_ || undo_bits_ || undo_loops_ || undo_tps_) {
+  if (undo_orientation_ || undo_main_bit_depth_ || undo_loops_ || undo_tps_ ||
+      undo_intensity_) {
     HeaderMod mod;
     mod.set_orientation = 0;
     if (undo_orientation_) {
       mod.set_orientation = orient_before_;
     }
     mod.set_bits_per_sample =
-        undo_bits_ && have_bits_before_ ? bits_per_sample_before_ : 0;
+        undo_main_bit_depth_ ? main_bit_depth_before_.bits_per_sample : 0;
+    if (undo_main_bit_depth_) {
+      mod.set_main_float_sample = true;
+      mod.main_float_sample = main_bit_depth_before_.float_sample;
+      if (main_bit_depth_before_.float_sample) {
+        mod.set_main_exp_bits = true;
+        mod.main_exp_bits = main_bit_depth_before_.exp_bits;
+      }
+    }
     mod.have_set_num_loops = undo_loops_ && have_animation_before_;
     mod.set_num_loops = num_loops_before_;
     mod.have_set_tps = undo_tps_ && have_animation_before_;
     mod.set_tps_numerator = tps_num_before_;
     mod.set_tps_denominator = tps_den_before_;
+    if (undo_intensity_) {
+      mod.have_tone_mapping_snapshot = true;
+      mod.tone_mapping_snapshot = tone_mapping_before_;
+      mod.collapse_to_packed_all_default_image_metadata =
+          image_metadata_all_default_before_;
+    }
     if (!ApplyHeaderMod(&parsed, mod)) {
       return ReversibleCheckStatus::kMismatch;
     }
+    if (undo_main_bit_depth_) {
+      parsed.image.metadata.bit_depth = main_bit_depth_before_;
+    }
   }
 
-  if (opsin_undo_) {
-    OpsinAdjustParams oa;
-    oa.undo_inverse = true;
-    if (opsin_set_exp_) oa.exposure_ev = opsin_ev_;
-    if (opsin_set_temp_) oa.temperature = opsin_temp_;
-    if (opsin_set_tint_) oa.tint = opsin_tint_;
-    if (opsin_set_hue_) oa.hue = opsin_hue_;
-    bool changed = false;
-    if (!ApplyOpsinAdjust(&parsed, oa, &changed)) {
-      return ReversibleCheckStatus::kMismatch;
+  if (undo_extra_channels_) {
+    for (const auto& pr : extra_channel_undo_) {
+      if (!RestoreExtraChannelInfoAtIndex(&parsed, pr.first, pr.second)) {
+        return ReversibleCheckStatus::kMismatch;
+      }
     }
-    (void)changed;
   }
 
   for (ssize_t fri = static_cast<ssize_t>(frame_region_undos_.size()) - 1;
@@ -936,33 +1317,9 @@ ReversibleCheckStatus UndoRecorder::VerifyRoundtripCodestream(
     }
   }
 
-  if (toc_undo_) {
-    for (const FramedUnitTocSnapshot& snap : toc_snaps_) {
-      if (snap.frame_index >= parsed.frames.size()) {
-        return ReversibleCheckStatus::kMismatch;
-      }
-      RestoreFramedUnitTocSnapshot(snap, &parsed.frames[snap.frame_index]);
-    }
-  }
-
-  if (!photon_undos_.empty()) {
-    for (ssize_t i = static_cast<ssize_t>(photon_undos_.size()) - 1; i >= 0; --i) {
-      const PhotonNoiseUndoSpec& u = photon_undos_[static_cast<size_t>(i)];
-      if (!ApplyPhotonNoiseUndo(&parsed, u)) {
-        return ReversibleCheckStatus::kMismatch;
-      }
-    }
-  }
-
-  if (epf_restore_verify_) {
-    for (size_t fi = 0; fi < epf_rf_before_valid_.size(); ++fi) {
-      if (!epf_rf_before_valid_[fi]) continue;
-      if (!ApplyRestorationFilterExactRestore(&parsed, fi, epf_rf_before_[fi])) {
-        return ReversibleCheckStatus::kMismatch;
-      }
-    }
-  }
-
+  // Reverse of jxltran.cc transform_codestream after crop: gab, epf,
+  // set-splines-from (add-only), photon, lf_dc, lf_global, toc, then blend /
+  // keep+blend (when not emitted as separate undo), etc.
   const std::vector<size_t>* sel =
       selective_frames_.empty() ? nullptr : &selective_frames_;
 
@@ -979,16 +1336,10 @@ ReversibleCheckStatus UndoRecorder::VerifyRoundtripCodestream(
     }
   }
 
-  if (!blend_undos_.empty()) {
-    std::vector<size_t> ord(blend_undos_.size());
-    for (size_t j = 0; j < ord.size(); ++j) ord[j] = j;
-    std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) {
-      return blend_undos_[a].frame_index < blend_undos_[b].frame_index;
-    });
-    for (size_t j = 0; j < ord.size(); ++j) {
-      const BlendUndo& b = blend_undos_[ord[j]];
-      if (!ApplyFrameBlendExactRestore(&parsed, b.frame_index, b.main, b.ec,
-                                       b.save_as_reference)) {
+  if (epf_restore_verify_) {
+    for (size_t fi = 0; fi < epf_rf_before_valid_.size(); ++fi) {
+      if (!epf_rf_before_valid_[fi]) continue;
+      if (!ApplyRestorationFilterExactRestore(&parsed, fi, epf_rf_before_[fi])) {
         return ReversibleCheckStatus::kMismatch;
       }
     }
@@ -1007,6 +1358,122 @@ ReversibleCheckStatus UndoRecorder::VerifyRoundtripCodestream(
         return ReversibleCheckStatus::kMismatch;
       }
     }
+  }
+
+  if (!photon_undos_.empty()) {
+    for (ssize_t i = static_cast<ssize_t>(photon_undos_.size()) - 1; i >= 0; --i) {
+      const PhotonNoiseUndoSpec& u = photon_undos_[static_cast<size_t>(i)];
+      if (!ApplyPhotonNoiseUndo(&parsed, u)) {
+        return ReversibleCheckStatus::kMismatch;
+      }
+    }
+  }
+
+  if (!lf_global_scale_undos_.empty()) {
+    std::vector<size_t> ord;
+    ord.reserve(lf_global_scale_undos_.size());
+    for (size_t i = 0; i < lf_global_scale_undos_.size(); ++i) {
+      ord.push_back(i);
+    }
+    std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) {
+      return lf_global_scale_undos_[a].frame_index <
+             lf_global_scale_undos_[b].frame_index;
+    });
+    std::vector<size_t> frame_indices;
+    frame_indices.reserve(ord.size());
+    for (size_t k = 0; k < ord.size(); ++k) {
+      frame_indices.push_back(lf_global_scale_undos_[ord[k]].frame_index);
+    }
+    const uint32_t old_scale = lf_global_scale_undos_[ord[0]].old_scale;
+    if (!ApplyLfGlobalScale(&parsed, true, old_scale, &frame_indices)) {
+      return ReversibleCheckStatus::kMismatch;
+    }
+    if (spline_add_undos_.empty()) {
+      for (const LfGlobalScaleUndoEntry& e : lf_global_scale_undos_) {
+        if (e.lf_chunk0_tail_trim_bytes == 0) continue;
+        if (!ApplyLfGlobalPhysicalChunk0TailTrim(
+                &parsed, e.frame_index, e.lf_chunk0_tail_trim_bytes)) {
+          return ReversibleCheckStatus::kMismatch;
+        }
+      }
+    }
+  }
+
+  if (lf_dc_quant_mul_undo_) {
+    const std::vector<size_t>* lf_dc_sel =
+        selective_frames_.empty() ? nullptr : &selective_frames_;
+    float inv_mul[3] = {1.f / lf_dc_quant_mul_forward_[0],
+                        1.f / lf_dc_quant_mul_forward_[1],
+                        1.f / lf_dc_quant_mul_forward_[2]};
+    if (!ApplyLfDcQuantMul(&parsed, true, inv_mul, lf_dc_sel)) {
+      return ReversibleCheckStatus::kMismatch;
+    }
+  }
+
+  if (toc_undo_) {
+    for (const FramedUnitTocSnapshot& snap : toc_snaps_) {
+      if (snap.frame_index >= parsed.frames.size()) {
+        return ReversibleCheckStatus::kMismatch;
+      }
+      RestoreFramedUnitTocSnapshot(snap, &parsed.frames[snap.frame_index]);
+    }
+  }
+
+  if (!blend_undos_.empty()) {
+    std::vector<size_t> ord(blend_undos_.size());
+    for (size_t j = 0; j < ord.size(); ++j) ord[j] = j;
+    std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) {
+      return blend_undos_[a].frame_index < blend_undos_[b].frame_index;
+    });
+    for (size_t j = 0; j < ord.size(); ++j) {
+      const BlendUndo& b = blend_undos_[ord[j]];
+      if (!ApplyFrameBlendExactRestore(&parsed, b.frame_index, b.main, b.ec,
+                                       b.save_as_reference)) {
+        return ReversibleCheckStatus::kMismatch;
+      }
+    }
+  }
+
+  // Opsin runs before frame regions / crop in the forward pass; undo after
+  // blend (which runs after toc in jxltran.cc).
+  if (opsin_quant_bias_undo_) {
+    OpsinAdjustParams oq;
+    for (int qi = 0; qi < 4; ++qi) {
+      if (!opsin_quant_bias_set_[qi]) continue;
+      oq.quant_bias_delta[qi].set = true;
+      oq.quant_bias_delta[qi].value = opsin_quant_bias_v_[qi];
+    }
+    bool q_changed = false;
+    if (!ApplyOpsinAdjust(&parsed, oq, &q_changed)) {
+      return ReversibleCheckStatus::kMismatch;
+    }
+    (void)q_changed;
+  }
+  if (opsin_bias_undo_) {
+    OpsinAdjustParams ob;
+    for (int bi = 0; bi < 3; ++bi) {
+      if (!opsin_bias_set_[bi]) continue;
+      ob.opsin_bias_xyb[bi].set = true;
+      ob.opsin_bias_xyb[bi].value = opsin_bias_v_[bi];
+    }
+    bool bias_changed = false;
+    if (!ApplyOpsinAdjust(&parsed, ob, &bias_changed)) {
+      return ReversibleCheckStatus::kMismatch;
+    }
+    (void)bias_changed;
+  }
+  if (opsin_undo_) {
+    OpsinAdjustParams oa;
+    oa.undo_inverse = true;
+    if (opsin_set_exp_) oa.exposure_ev = opsin_ev_;
+    if (opsin_set_temp_) oa.temperature = opsin_temp_;
+    if (opsin_set_tint_) oa.tint = opsin_tint_;
+    if (opsin_set_hue_) oa.hue = opsin_hue_;
+    bool changed = false;
+    if (!ApplyOpsinAdjust(&parsed, oa, &changed)) {
+      return ReversibleCheckStatus::kMismatch;
+    }
+    (void)changed;
   }
 
   if (!frame_name_undos_.empty()) {
@@ -1053,7 +1520,8 @@ ReversibleCheckStatus UndoRecorder::VerifyRoundtripCodestream(
   }
 
   if (epf_restore_verify_ || gab_undo_ || toc_undo_ ||
-      !spline_add_undos_.empty()) {
+      !spline_add_undos_.empty() || lf_dc_quant_mul_undo_ ||
+      !lf_global_scale_undos_.empty()) {
     ParsedCodestream exp_cs;
     if (!ReadCodestream(expected_codestream.data(), expected_codestream.size(),
                          &exp_cs)) {
@@ -1146,6 +1614,56 @@ ReversibleCheckStatus UndoRecorder::VerifyRoundtripCodestream(
         return ReversibleCheckStatus::kMismatch;
       }
     }
+
+    std::vector<size_t> lf_prefix_only;
+    const auto in_epf_prefix = [&](size_t fi) -> bool {
+      return epf_restore_verify_ && fi < epf_rf_before_valid_.size() &&
+             epf_rf_before_valid_[fi];
+    };
+    const auto maybe_add_lf_prefix = [&](size_t fi) {
+      if (std::binary_search(whole_frame_asc.begin(), whole_frame_asc.end(),
+                             fi)) {
+        return;
+      }
+      if (in_epf_prefix(fi)) return;
+      lf_prefix_only.push_back(fi);
+    };
+    if (!lf_global_scale_undos_.empty()) {
+      for (const LfGlobalScaleUndoEntry& e : lf_global_scale_undos_) {
+        maybe_add_lf_prefix(e.frame_index);
+      }
+    }
+    if (lf_dc_quant_mul_undo_) {
+      for (size_t fi : lf_dc_splice_frames_) {
+        maybe_add_lf_prefix(fi);
+      }
+    }
+    std::sort(lf_prefix_only.begin(), lf_prefix_only.end());
+    lf_prefix_only.erase(std::unique(lf_prefix_only.begin(), lf_prefix_only.end()),
+                         lf_prefix_only.end());
+    sort_frame_index_desc(&lf_prefix_only);
+    for (size_t k = 0; k < lf_prefix_only.size(); ++k) {
+      const size_t fi = lf_prefix_only[k];
+      ParsedCodestream cur_cs;
+      if (!ReadCodestream(restored.data(), restored.size(), &cur_cs)) {
+        return ReversibleCheckStatus::kMismatch;
+      }
+      if (fi >= cur_cs.frames.size() || fi >= exp_cs.frames.size()) {
+        return ReversibleCheckStatus::kMismatch;
+      }
+      const FramedUnit& rfu = cur_cs.frames[fi];
+      const FramedUnit& efu = exp_cs.frames[fi];
+      const size_t r0 = rfu.original_frame_byte_offset * 8;
+      const size_t r1 = r0 + rfu.full_frame_byte_len * 8;
+      const size_t e0 = efu.original_frame_byte_offset * 8;
+      const size_t e1 = e0 + efu.full_frame_byte_len * 8;
+      if (r1 < r0 || e1 < e0) return ReversibleCheckStatus::kMismatch;
+      if (!SpliceCodestreamReplaceBitSpan(
+              &restored, r0, r1, expected_codestream.data(),
+              expected_codestream.size(), e0, e1 - e0)) {
+        return ReversibleCheckStatus::kMismatch;
+      }
+    }
   }
 
   if (restored.size() != expected_codestream.size()) {
@@ -1156,6 +1674,37 @@ ReversibleCheckStatus UndoRecorder::VerifyRoundtripCodestream(
     return ReversibleCheckStatus::kMismatch;
   }
   return ReversibleCheckStatus::kOk;
+}
+
+void ListLfDcQuantMulTargetFrames(const ParsedCodestream& cs, const float mul[3],
+                                  const std::vector<size_t>* only_frames,
+                                  std::vector<size_t>* out_frames) {
+  out_frames->clear();
+  bool any_mul_change = false;
+  for (int c = 0; c < 3; ++c) {
+    if (std::fabs(mul[c] - 1.0f) > 1e-5f) any_mul_change = true;
+  }
+  if (!any_mul_change) return;
+  const auto want_frame = [&](size_t idx) -> bool {
+    if (only_frames == nullptr || only_frames->empty()) return true;
+    return std::binary_search(only_frames->begin(), only_frames->end(), idx);
+  };
+  for (size_t fi = 0; fi < cs.frames.size(); ++fi) {
+    if (!want_frame(fi)) continue;
+    const FramedUnit& fu = cs.frames[fi];
+    const FrameHeader& fh = fu.frame;
+    const uint32_t ft = fh.frame_type;
+    if (ft == kFrameTypeLF || ft == kFrameTypeReferenceOnly) continue;
+    if (ft != kFrameTypeRegular && ft != kFrameTypeSkipProgressive) continue;
+    if (!fu.lf_global_dc_quant_parsed) continue;
+    if (fu.spline_edit) continue;
+    if (fu.toc_strip_perm_reorder || !fu.toc_body_stream_shuffle.empty()) {
+      continue;
+    }
+    const size_t old_len = fu.lf_global_dc_quant_rel_region_old_len_bits;
+    if (old_len != 1 && old_len != 49) continue;
+    out_frames->push_back(fi);
+  }
 }
 
 bool ArgsBoxPipelineReversibleForUndo(bool strip_nonzero, bool jxlp_non_keep,
